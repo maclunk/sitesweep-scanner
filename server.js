@@ -5,304 +5,246 @@ const { chromium } = require('playwright');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// CORS configuration
+const DEFAULT_TIMEOUT_MS = 30_000;
+const USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
+const HEADLESS_ARGS = [
+  '--no-sandbox',
+  '--disable-setuid-sandbox',
+  '--disable-dev-shm-usage',
+  '--disable-accelerated-2d-canvas',
+  '--disable-gpu',
+];
+
 const corsOptions = {
-  origin: process.env.FRONTEND_URL || '*', // Allow all origins if FRONTEND_URL not set
+  origin: process.env.FRONTEND_URL || '*',
   credentials: true,
 };
 
 app.use(cors(corsOptions));
 app.use(express.json());
 
-// Health check endpoint
-app.get('/health', (req, res) => {
+const normalizeUrl = (rawUrl = '') => {
+  const trimmed = rawUrl.trim();
+  if (!trimmed) {
+    throw new Error('URL is required');
+  }
+
+  if (!/^https?:\/\//i.test(trimmed)) {
+    return `https://${trimmed}`;
+  }
+  return trimmed;
+};
+
+const buildIssue = (category, severity, message) => ({
+  category,
+  severity,
+  message,
+});
+
+app.get('/health', (_req, res) => {
   res.json({ status: 'ok', service: 'sitesweep-scanner' });
 });
 
-// Scan endpoint
 app.post('/scan', async (req, res) => {
-  let browser = null;
-  
+  let browser;
+
   try {
-    const { url, jobId } = req.body;
-
-    // Validate URL
-    if (!url || typeof url !== 'string') {
-      return res.status(400).json({
-        success: false,
-        error: 'URL is required and must be a string',
-      });
-    }
-
-    // Validate URL format
+    const normalized = normalizeUrl(req.body?.url || '');
     let targetUrl;
     try {
-      targetUrl = new URL(url);
+      targetUrl = new URL(normalized);
       if (!['http:', 'https:'].includes(targetUrl.protocol)) {
-        throw new Error('Invalid protocol');
+        throw new Error('Only HTTP/HTTPS protocols are allowed.');
       }
-    } catch (error) {
-      return res.status(400).json({
-        success: false,
-        error: 'Invalid URL format. Must be http:// or https://',
-      });
+    } catch (err) {
+      return res.status(400).json({ error: 'Invalid URL. Provide a valid http(s) URL.' });
     }
 
-    console.log(`[Scanner] Starting scan for ${url} (Job ID: ${jobId || 'N/A'})`);
+    console.log(`[EliteScanner] Starting scan for ${targetUrl.href}`);
 
-    // Launch browser
-    browser = await chromium.launch({
-      headless: true,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--disable-gpu',
-      ],
-    });
-
+    browser = await chromium.launch({ headless: true, args: HEADLESS_ARGS });
     const context = await browser.newContext({
       viewport: { width: 1920, height: 1080 },
-      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 SiteSweep/1.0',
+      userAgent: USER_AGENT,
+    });
+
+    const gdprFindings = {
+      googleFonts: false,
+      googleMaps: false,
+    };
+
+    await context.route('**/*', async (route) => {
+      try {
+        const reqUrl = route.request().url();
+        if (/fonts\.g(static|oogleapis)\.com/i.test(reqUrl)) {
+          gdprFindings.googleFonts = true;
+        }
+        if (/maps\.(googleapis|gstatic)\.com/i.test(reqUrl)) {
+          gdprFindings.googleMaps = true;
+        }
+        await route.continue();
+      } catch (routeError) {
+        console.warn('[EliteScanner] Route interception error:', routeError.message);
+        try {
+          await route.continue();
+        } catch {
+          /* no-op */
+        }
+      }
     });
 
     const page = await context.newPage();
+    page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
 
-    // Set timeout for page operations
-    page.setDefaultTimeout(30000); // 30 seconds
+    await page.goto(targetUrl.href, {
+      waitUntil: 'domcontentloaded',
+      timeout: DEFAULT_TIMEOUT_MS,
+    });
+    await page.waitForLoadState('networkidle', { timeout: DEFAULT_TIMEOUT_MS }).catch(() => {});
 
-    // Navigate to URL
-    let response;
-    try {
-      response = await page.goto(url, {
-        waitUntil: 'networkidle',
-        timeout: 30000,
-      });
-    } catch (navError) {
-      throw new Error(`Failed to navigate to URL: ${navError.message}`);
-    }
+    const finalUrl = page.url();
+    const finalProtocol = (() => {
+      try {
+        return new URL(finalUrl).protocol;
+      } catch {
+        return 'http:';
+      }
+    })();
 
-    if (!response) {
-      throw new Error('No response received from URL');
-    }
-
-    // Wait for page to be fully loaded
-    await page.waitForLoadState('domcontentloaded');
-
-    // Collect page data
     const pageData = await page.evaluate(() => {
-      const getMetaContent = (name) => {
-        const meta = document.querySelector(`meta[name="${name}"], meta[property="${name}"]`);
-        return meta ? meta.getAttribute('content') : null;
-      };
+      const lowerHtml = document.documentElement.innerHTML.toLowerCase();
+      const anchors = Array.from(document.querySelectorAll('a'));
+      const hasImpressumLink = anchors.some((a) => (a.textContent || '').toLowerCase().includes('impressum'));
+      const techStack = new Set();
 
-      const getViewportMeta = () => {
-        const viewport = document.querySelector('meta[name="viewport"]');
-        return viewport ? viewport.getAttribute('content') : null;
-      };
-
-      const checkKeyword = (keyword) => {
-        const bodyText = document.body ? document.body.innerText.toLowerCase() : '';
-        return bodyText.includes(keyword.toLowerCase());
-      };
+      if (lowerHtml.includes('wp-content')) techStack.add('WordPress');
+      if (lowerHtml.includes('wixstatic.com') || lowerHtml.includes('wixsite.com')) techStack.add('Wix');
+      if (lowerHtml.includes('jimstatic.com') || lowerHtml.includes('jimdo')) techStack.add('Jimdo');
+      if (lowerHtml.includes('squarespace')) techStack.add('Squarespace');
+      if (lowerHtml.includes('shopify')) techStack.add('Shopify');
+      if (lowerHtml.includes('google-analytics') || lowerHtml.includes('gtag(') || lowerHtml.includes('gtm.js')) {
+        techStack.add('Google Analytics');
+      }
 
       return {
-        title: document.title || '',
-        url: window.location.href,
-        protocol: window.location.protocol,
-        viewportMeta: getViewportMeta(),
-        hasImpressum: checkKeyword('Impressum') || checkKeyword('Imprint'),
-        hasDatenschutz: checkKeyword('Datenschutz') || checkKeyword('Privacy') || checkKeyword('Datenschutzerklärung'),
-        hasCookieBanner: checkKeyword('Cookie') || checkKeyword('Cookies'),
-        metaDescription: getMetaContent('description'),
-        htmlLang: document.documentElement.lang || null,
+        title: document.title?.trim() || '',
+        metaDescription: document.querySelector('meta[name="description"]')?.getAttribute('content')?.trim() || '',
+        hasViewportMeta: Boolean(document.querySelector('meta[name="viewport"]')),
+        hasImpressumLink,
+        h1Count: document.querySelectorAll('h1').length,
+        techStack: Array.from(techStack),
       };
     });
 
-    // Perform checks and generate issues
     const issues = [];
     let score = 100;
-
-    // Check 1: Title
-    if (!pageData.title || pageData.title.trim().length === 0) {
-      issues.push({
-        id: 'missing-title',
-        category: 'seo',
-        title: 'Fehlender Seitentitel',
-        description: 'Die Seite hat keinen Titel. Dies beeinträchtigt SEO und die Benutzerfreundlichkeit.',
-        severity: 'high',
-        pages: [url],
-      });
-      score -= 10;
-    } else if (pageData.title.length < 30) {
-      issues.push({
-        id: 'title-too-short',
-        category: 'seo',
-        title: 'Seitentitel zu kurz',
-        description: `Der Seitentitel ist nur ${pageData.title.length} Zeichen lang. Empfohlen: 50-60 Zeichen für optimale SEO.`,
-        severity: 'medium',
-        pages: [url],
-      });
-      score -= 5;
-    }
-
-    // Check 2: SSL/HTTPS
-    if (pageData.protocol !== 'https:') {
-      issues.push({
-        id: 'no-ssl',
-        category: 'technical',
-        title: 'Keine SSL-Verschlüsselung',
-        description: 'Die Website verwendet kein HTTPS. Dies ist ein Sicherheitsrisiko und wird von Browsern als "Nicht sicher" markiert.',
-        severity: 'high',
-        pages: [url],
-      });
-      score -= 20;
-    }
-
-    // Check 3: Viewport Meta Tag (Mobile)
-    if (!pageData.viewportMeta) {
-      issues.push({
-        id: 'missing-viewport',
-        category: 'ux',
-        title: 'Fehlender Viewport Meta-Tag',
-        description: 'Die Seite hat keinen Viewport Meta-Tag. Dies führt zu Problemen auf mobilen Geräten.',
-        severity: 'high',
-        pages: [url],
-      });
-      score -= 15;
-    } else {
-      // Check if viewport is mobile-friendly
-      const viewportLower = pageData.viewportMeta.toLowerCase();
-      if (!viewportLower.includes('width=device-width')) {
-        issues.push({
-          id: 'viewport-not-mobile',
-          category: 'ux',
-          title: 'Viewport nicht mobil-optimiert',
-          description: 'Der Viewport Meta-Tag ist nicht für mobile Geräte optimiert.',
-          severity: 'medium',
-          pages: [url],
-        });
-        score -= 10;
-      }
-    }
-
-    // Check 4: Impressum
-    if (!pageData.hasImpressum) {
-      issues.push({
-        id: 'missing-impressum',
-        category: 'legal',
-        title: 'Kein Impressum gefunden',
-        description: 'Auf der Seite wurde kein Impressum gefunden. Dies ist in Deutschland für gewerbliche Websites gesetzlich vorgeschrieben.',
-        severity: 'high',
-        pages: [url],
-      });
-      score -= 15;
-    }
-
-    // Check 5: Datenschutz
-    if (!pageData.hasDatenschutz) {
-      issues.push({
-        id: 'missing-datenschutz',
-        category: 'legal',
-        title: 'Keine Datenschutzerklärung gefunden',
-        description: 'Auf der Seite wurde keine Datenschutzerklärung gefunden. Dies ist nach DSGVO gesetzlich vorgeschrieben.',
-        severity: 'high',
-        pages: [url],
-      });
-      score -= 15;
-    }
-
-    // Check 6: Meta Description
-    if (!pageData.metaDescription) {
-      issues.push({
-        id: 'missing-meta-description',
-        category: 'seo',
-        title: 'Fehlende Meta-Beschreibung',
-        description: 'Die Seite hat keine Meta-Beschreibung. Dies beeinträchtigt SEO und die Darstellung in Suchmaschinen.',
-        severity: 'medium',
-        pages: [url],
-      });
-      score -= 5;
-    }
-
-    // Ensure score is not negative
-    score = Math.max(0, score);
-
-    // Generate summary
-    const highIssues = issues.filter(i => i.severity === 'high').length;
-    const mediumIssues = issues.filter(i => i.severity === 'medium').length;
-    const lowIssues = issues.filter(i => i.severity === 'low').length;
-
-    const summary = `Analyse abgeschlossen. ${issues.length} Problem${issues.length !== 1 ? 'e' : ''} gefunden: ${highIssues} kritisch, ${mediumIssues} mittel, ${lowIssues} niedrig.`;
-
-    // Calculate score breakdown
-    const scoreBreakdown = {
-      technical: 100,
-      seo: 100,
-      legal: 100,
-      ux: 100,
+    const applyPenalty = (amount) => {
+      score = Math.max(0, score - amount);
     };
 
-    // Adjust breakdown based on issues
-    issues.forEach(issue => {
-      const penalty = issue.severity === 'high' ? 20 : issue.severity === 'medium' ? 10 : 5;
-      if (scoreBreakdown[issue.category]) {
-        scoreBreakdown[issue.category] = Math.max(0, scoreBreakdown[issue.category] - penalty);
-      }
-    });
+    if (finalProtocol !== 'https:') {
+      issues.push(
+        buildIssue('security', 'high', 'Webseite ist nicht verschlüsselt (kein HTTPS).')
+      );
+      applyPenalty(40);
+    }
 
-    console.log(`[Scanner] Scan completed for ${url}. Score: ${score}, Issues: ${issues.length}`);
+    if (!pageData.hasViewportMeta) {
+      issues.push(
+        buildIssue('mobile', 'high', 'Kein responsiver Viewport-Meta-Tag gefunden.')
+      );
+      applyPenalty(20);
+    }
 
-    // Return result
+    if (!pageData.hasImpressumLink) {
+      issues.push(
+        buildIssue('legal', 'critical', 'Kein Impressum-Link gefunden.')
+      );
+      applyPenalty(30);
+    }
+
+    if (gdprFindings.googleFonts) {
+      issues.push(
+        buildIssue('gdpr', 'high', 'Google Fonts werden extern geladen (mögliche DSGVO-Verletzung).')
+      );
+      applyPenalty(20);
+    }
+
+    if (gdprFindings.googleMaps) {
+      issues.push(
+        buildIssue('gdpr', 'medium', 'Google Maps wird extern eingebunden.')
+      );
+    }
+
+    if (!pageData.title || pageData.title.length < 10) {
+      const lengthInfo = pageData.title ? ` (${pageData.title.length} Zeichen)` : '';
+      issues.push(
+        buildIssue('seo', 'medium', `Seitentitel fehlt oder ist zu kurz${lengthInfo}.`)
+      );
+      applyPenalty(5);
+    }
+
+    if (!pageData.metaDescription) {
+      issues.push(
+        buildIssue('seo', 'medium', 'Meta-Description fehlt.')
+      );
+      applyPenalty(5);
+    }
+
+    if (pageData.h1Count === 0 || pageData.h1Count > 1) {
+      issues.push(
+        buildIssue('seo', 'medium', `H1-Struktur fehlerhaft (gefunden: ${pageData.h1Count}).`)
+      );
+      applyPenalty(5);
+    }
+
+    let screenshotBase64 = null;
+    try {
+      const screenshotBuffer = await page.screenshot({
+        fullPage: false,
+        type: 'jpeg',
+        quality: 60,
+      });
+      screenshotBase64 = screenshotBuffer.toString('base64');
+    } catch (shotError) {
+      console.warn('[EliteScanner] Screenshot failed:', shotError.message);
+    }
+
+    const techStack = Array.from(new Set(pageData.techStack));
+
     res.json({
-      success: true,
-      data: {
-        score,
-        summary,
-        issues,
-        scoreBreakdown,
-        scoreRaw: score,
-        mobileScreenshotUrl: null, // Screenshot generation can be added later
-      },
+      url: targetUrl.href,
+      finalUrl,
+      score,
+      screenshot: screenshotBase64,
+      issues,
+      techStack,
     });
-
   } catch (error) {
-    console.error('[Scanner] Error during scan:', error);
-    
-    res.status(500).json({
-      success: false,
-      error: error.message || 'An error occurred during scanning',
-      details: process.env.NODE_ENV === 'development' ? error.stack : undefined,
-    });
+    console.error('[EliteScanner] Scan failed:', error);
+    res.status(500).json({ error: error.message || 'Scan failed' });
   } finally {
-    // Always close browser
     if (browser) {
       try {
         await browser.close();
-        console.log('[Scanner] Browser closed');
       } catch (closeError) {
-        console.error('[Scanner] Error closing browser:', closeError);
+        console.error('[EliteScanner] Browser close error:', closeError);
       }
     }
   }
 });
 
-// Start server
 app.listen(PORT, () => {
-  console.log(`[Scanner] Server running on port ${PORT}`);
-  console.log(`[Scanner] Health check: http://localhost:${PORT}/health`);
-  console.log(`[Scanner] Scan endpoint: http://localhost:${PORT}/scan`);
+  console.log(`[EliteScanner] Server listening on ${PORT}`);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('[Scanner] SIGTERM received, shutting down gracefully');
+  console.log('[EliteScanner] SIGTERM received, shutting down.');
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  console.log('[Scanner] SIGINT received, shutting down gracefully');
+  console.log('[EliteScanner] SIGINT received, shutting down.');
   process.exit(0);
 });
-
