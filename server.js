@@ -1,47 +1,30 @@
-/**
- * ============================================================================
- * ELITE SCANNER SERVICE - Deep Technical Audit for SME Websites
- * ============================================================================
- * Performs comprehensive website analysis targeting pain points for:
- * - Lawyers (Legal compliance, Impressum)
- * - Doctors (Privacy, GDPR)
- * - Craftsmen (Mobile-first, SEO basics)
- * 
- * Features:
- * - SSL/HTTPS Security Check
- * - Mobile Responsiveness Detection
- * - Legal Compliance (Impressum)
- * - GDPR Violation Detection (Google Fonts/Maps)
- * - SEO Analysis (Title, Description, Headings)
- * - Technology Stack Detection
- * - Performance & Accessibility Insights
- * ============================================================================
- */
+'use strict';
 
 const express = require('express');
 const cors = require('cors');
 const { chromium } = require('playwright');
 
+// ---------------------------------------------------------------------------
+// Basic setup
+// ---------------------------------------------------------------------------
+
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// ============================================================================
-// CONFIGURATION
-// ============================================================================
+// Hard cap for each scan in milliseconds (30 seconds)
+const DEFAULT_TIMEOUT_MS = 30_000;
 
-const DEFAULT_TIMEOUT_MS = 30_000; // 30 seconds max per scan
+// Desktop Chrome user agent so we look like a normal browser
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-// Chromium launch arguments optimized for Docker/Cloud environments
+// Safe headless flags for common hosting environments
 const HEADLESS_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
   '--disable-dev-shm-usage',
   '--disable-accelerated-2d-canvas',
   '--disable-gpu',
-  '--disable-background-networking',
-  '--disable-default-apps',
 ];
 
 const corsOptions = {
@@ -52,225 +35,138 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.use(express.json());
 
-// ============================================================================
-// UTILITY FUNCTIONS
-// ============================================================================
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 /**
- * Normalizes a user-provided URL
- * - Adds https:// if no protocol specified
- * - Validates format
+ * Normalize and validate user URL input.
+ * - Adds https:// if missing.
+ * - Ensures only http/https protocols.
  */
-const normalizeUrl = (rawUrl = '') => {
-  const trimmed = rawUrl.trim();
+function normalizeUrl(rawUrl = '') {
+  const trimmed = String(rawUrl || '').trim();
   if (!trimmed) {
     throw new Error('URL is required');
   }
 
-  // Add https:// if no protocol specified
-  if (!/^https?:\/\//i.test(trimmed)) {
-    return `https://${trimmed}`;
+  const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+
+  let url;
+  try {
+    url = new URL(withProtocol);
+  } catch {
+    throw new Error('Invalid URL. Provide a valid http(s) URL.');
   }
-  return trimmed;
-};
+
+  if (!['http:', 'https:'].includes(url.protocol)) {
+    throw new Error('Only HTTP/HTTPS protocols are allowed.');
+  }
+
+  return url;
+}
 
 /**
- * Creates a standardized issue object with title and message
+ * Build a standardized issue object.
  */
-const buildIssue = (category, severity, title, message) => ({
-  category,
-  severity,
-  title,
-  message,
-});
-
-// ============================================================================
-// API ENDPOINTS
-// ============================================================================
+function buildIssue(category, severity, message) {
+  return { category, severity, message };
+}
 
 /**
- * Health check endpoint
+ * Run a function with a hard timeout.
  */
-app.get('/health', (_req, res) => {
-  res.json({ 
-    status: 'ok', 
-    service: 'sitesweep-scanner-elite',
-    version: '2.0.0'
+async function withTimeout(promise, timeoutMs, timeoutMessage) {
+  let timeoutId;
+  const timeoutPromise = new Promise((_, reject) => {
+    timeoutId = setTimeout(
+      () => reject(new Error(timeoutMessage || `Operation timed out after ${timeoutMs}ms`)),
+      timeoutMs
+    );
   });
-});
-
-/**
- * Main scanning endpoint - performs deep technical audit
- */
-app.post('/scan', async (req, res) => {
-  let browser;
-  const scanStartTime = Date.now();
 
   try {
-    // ========================================================================
-    // STEP 1: URL Validation & Normalization
-    // ========================================================================
-    
-    const normalized = normalizeUrl(req.body?.url || '');
-    let targetUrl;
-    
-    try {
-      targetUrl = new URL(normalized);
-      if (!['http:', 'https:'].includes(targetUrl.protocol)) {
-        throw new Error('Only HTTP/HTTPS protocols are allowed.');
-      }
-    } catch (err) {
-      return res.status(400).json({ 
-        error: 'Invalid URL. Provide a valid http(s) URL.',
-        details: err.message
-      });
-    }
+    const result = await Promise.race([promise, timeoutPromise]);
+    clearTimeout(timeoutId);
+    return result;
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
+  }
+}
 
-    console.log(`[EliteScanner] 🔍 Starting deep scan for: ${targetUrl.href}`);
+// ---------------------------------------------------------------------------
+// Core scan logic
+// ---------------------------------------------------------------------------
 
-    // ========================================================================
-    // STEP 2: Browser Setup with Request Interception
-    // ========================================================================
-    
-    browser = await chromium.launch({ 
-      headless: true, 
+/**
+ * Perform the elite scan for a single URL.
+ * Returns the JSON object described in the requirements.
+ */
+async function performScan(inputUrl) {
+  let browser;
+
+  try {
+    const targetUrl = normalizeUrl(inputUrl);
+
+    console.log(`[EliteScanner] Starting scan for ${targetUrl.href}`);
+
+    // 1) Setup browser and context
+    browser = await chromium.launch({
+      headless: true,
       args: HEADLESS_ARGS,
-      timeout: DEFAULT_TIMEOUT_MS 
     });
-    
+
     const context = await browser.newContext({
       viewport: { width: 1920, height: 1080 },
       userAgent: USER_AGENT,
-      ignoreHTTPSErrors: true, // Allow scanning sites with invalid SSL
     });
 
-    // GDPR tracking: Monitor external resource loading
+    // 2) GDPR: track external fonts / maps via request interception
     const gdprFindings = {
       googleFonts: false,
       googleMaps: false,
-      googleAnalytics: false,
-      facebookPixel: false,
     };
 
-    // STRICT AUDITOR: Track quality issues
-    const qualityFindings = {
-      brokenResources: [],
-      mixedContent: [],
-      consoleErrors: [],
-      pageErrors: [],
-    };
-
-    const requestUrls = [];
-
-    // Intercept ALL network requests to detect GDPR violations
     await context.route('**/*', async (route) => {
       try {
         const reqUrl = route.request().url();
-        requestUrls.push(reqUrl);
 
-        // Check for Google Fonts (CRITICAL GDPR violation in Germany/EU)
-        if (/fonts\.g(static|oogleapis)\.com/i.test(reqUrl)) {
+        // Google Fonts
+        if (/fonts\.googleapis\.com/i.test(reqUrl) || /fonts\.gstatic\.com/i.test(reqUrl)) {
           gdprFindings.googleFonts = true;
         }
 
-        // Check for Google Maps
-        if (/maps\.(googleapis|gstatic)\.com/i.test(reqUrl)) {
+        // Google Maps
+        if (/maps\.googleapis\.com/i.test(reqUrl) || /maps\.gstatic\.com/i.test(reqUrl)) {
           gdprFindings.googleMaps = true;
-        }
-
-        // Check for Google Analytics
-        if (/google-analytics\.com|googletagmanager\.com/i.test(reqUrl)) {
-          gdprFindings.googleAnalytics = true;
-        }
-
-        // Check for Facebook Pixel
-        if (/facebook\.com\/tr|connect\.facebook\.net/i.test(reqUrl)) {
-          gdprFindings.facebookPixel = true;
         }
 
         await route.continue();
       } catch (routeError) {
-        console.warn('[EliteScanner] ⚠️  Route interception error:', routeError.message);
+        console.warn('[EliteScanner] Route interception error:', routeError.message);
         try {
           await route.continue();
         } catch {
-          // Silently fail if route already handled
+          // Never crash due to routing issues
         }
       }
     });
 
-    // ========================================================================
-    // STEP 3: Page Navigation & Content Loading
-    // ========================================================================
-    
     const page = await context.newPage();
     page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
 
-    // ========================================================================
-    // STRICT AUDITOR: Error & Quality Monitoring
-    // ========================================================================
-
-    // Listen for console errors (JavaScript errors)
-    page.on('console', (msg) => {
-      if (msg.type() === 'error') {
-        qualityFindings.consoleErrors.push(msg.text());
-        console.log('[StrictAuditor] 🔴 Console error:', msg.text().substring(0, 100));
-      }
-    });
-
-    // Listen for page errors (uncaught exceptions)
-    page.on('pageerror', (error) => {
-      qualityFindings.pageErrors.push(error.message);
-      console.log('[StrictAuditor] ❌ Page error:', error.message.substring(0, 100));
-    });
-
-    // Track all HTTP requests for mixed content detection
-    const httpRequests = [];
-    
-    // Listen for failed network requests (404s, broken resources) and track HTTP requests
-    page.on('response', async (response) => {
-      try {
-        const status = response.status();
-        const url = response.url();
-        const resourceType = response.request().resourceType();
-
-        // Track HTTP requests for later mixed content analysis
-        if (url.startsWith('http://') && ['image', 'stylesheet', 'script', 'font'].includes(resourceType)) {
-          httpRequests.push({ url, type: resourceType });
-        }
-
-        // Detect 404s on images, stylesheets, scripts
-        if (status === 404 && ['image', 'stylesheet', 'script', 'font'].includes(resourceType)) {
-          qualityFindings.brokenResources.push({ url, status, type: resourceType });
-          console.log(`[StrictAuditor] 💔 Broken resource (404): ${resourceType} - ${url.substring(0, 80)}`);
-        }
-      } catch (err) {
-        // Ignore errors in response handler
-      }
-    });
-
-    let navigationError = null;
-    
+    // 3) Navigate (HTTP vs HTTPS handled by final URL)
     try {
       await page.goto(targetUrl.href, {
         waitUntil: 'domcontentloaded',
         timeout: DEFAULT_TIMEOUT_MS,
       });
-      
-      // Wait for network to be idle (best effort, non-blocking)
-      await page.waitForLoadState('networkidle', { 
-        timeout: DEFAULT_TIMEOUT_MS 
-      }).catch(() => {
-        console.log('[EliteScanner] ℹ️  Network did not become idle, continuing...');
+      await page.waitForLoadState('networkidle', { timeout: DEFAULT_TIMEOUT_MS }).catch(() => {
+        // networkidle might never fire – that's OK
       });
-    } catch (navError) {
-      navigationError = navError.message;
-      console.error('[EliteScanner] ❌ Navigation error:', navError.message);
-      
-      // If we can't load the page at all, return early
-      if (!page.url() || page.url() === 'about:blank') {
-        throw new Error(`Could not load website: ${navError.message}`);
-      }
+    } catch {
+      throw new Error('Target site unreachable or timed out.');
     }
 
     const finalUrl = page.url();
@@ -282,775 +178,445 @@ app.post('/scan', async (req, res) => {
       }
     })();
 
-    console.log(`[EliteScanner] 📄 Final URL: ${finalUrl} (Protocol: ${finalProtocol})`);
-
-    // ========================================================================
-    // STEP 4: Deep Page Analysis (In-Browser JavaScript)
-    // ========================================================================
-    
+    // 4) Extract DOM-based info
     const pageData = await page.evaluate(() => {
-      const html = document.documentElement.innerHTML;
+      const html = document.documentElement?.innerHTML || '';
       const lowerHtml = html.toLowerCase();
-      const bodyText = document.body?.textContent || '';
-      
-      // ========================================================================
-      // STRICT AUDITOR: "Old School" HTML Archaeology
-      // ========================================================================
-      
-      const deprecatedTags = {
-        font: document.querySelectorAll('font').length,
-        center: document.querySelectorAll('center').length,
-        frameset: document.querySelectorAll('frameset').length,
-        marquee: document.querySelectorAll('marquee').length,
-        // Tables used for layout (with border attribute, old-school way)
-        tableLayout: Array.from(document.querySelectorAll('table[border]')).filter(
-          table => !table.closest('[role="table"]') // Exclude proper semantic tables
-        ).length,
-      };
-      
-      const hasDeprecatedHTML = 
-        deprecatedTags.font > 0 || 
-        deprecatedTags.center > 0 || 
-        deprecatedTags.frameset > 0 || 
-        deprecatedTags.marquee > 0 || 
-        deprecatedTags.tableLayout > 0;
 
-      // ========================================================================
-      // STRICT AUDITOR: Font Size Accessibility Check
-      // ========================================================================
-      
-      let bodyFontSize = 16; // Default
-      let minFontSize = 16;
-      
-      try {
-        const bodyElement = document.body;
-        if (bodyElement) {
-          const computed = window.getComputedStyle(bodyElement);
-          const fontSize = parseFloat(computed.fontSize);
-          if (!isNaN(fontSize)) {
-            bodyFontSize = fontSize;
-          }
-        }
-
-        // Check paragraph font sizes
-        const paragraphs = Array.from(document.querySelectorAll('p, li, span, div'));
-        const fontSizes = paragraphs.slice(0, 20).map(el => {
-          const style = window.getComputedStyle(el);
-          return parseFloat(style.fontSize);
-        }).filter(size => !isNaN(size) && size > 0);
-
-        if (fontSizes.length > 0) {
-          minFontSize = Math.min(...fontSizes);
-        }
-      } catch (err) {
-        // Ignore font size detection errors
-      }
-
-      const hasTinyFonts = minFontSize < 14;
-
-      // ========================================================================
-      // Legal compliance: Check for Impressum link
-      // ========================================================================
-      
       const anchors = Array.from(document.querySelectorAll('a'));
-      const impressumLink = anchors.find((a) => 
+      const hasImpressumLink = anchors.some((a) =>
         (a.textContent || '').toLowerCase().includes('impressum')
       );
-      const hasImpressumLink = Boolean(impressumLink);
-      const impressumUrl = impressumLink ? impressumLink.href : null;
 
-      // Check for other legal pages
-      const datenschutzLink = anchors.find((a) => 
-        (a.textContent || '').toLowerCase().includes('datenschutz')
-      );
-      const hasDatenschutzLink = Boolean(datenschutzLink);
+      const techStackSet = new Set();
 
-      // Technology detection
-      const techStack = new Set();
-      
-      // CMS Detection
-      if (lowerHtml.includes('wp-content') || lowerHtml.includes('wp-includes')) {
-        techStack.add('WordPress');
-      }
-      if (lowerHtml.includes('wixstatic.com') || lowerHtml.includes('wixsite.com')) {
-        techStack.add('Wix');
-      }
-      if (lowerHtml.includes('jimstatic.com') || lowerHtml.includes('jimdo')) {
-        techStack.add('Jimdo');
-      }
-      if (lowerHtml.includes('squarespace')) {
-        techStack.add('Squarespace');
-      }
-      if (lowerHtml.includes('shopify') || lowerHtml.includes('myshopify.com')) {
-        techStack.add('Shopify');
-      }
-      if (lowerHtml.includes('typo3')) {
-        techStack.add('TYPO3');
-      }
-      if (lowerHtml.includes('drupal')) {
-        techStack.add('Drupal');
-      }
-      if (lowerHtml.includes('joomla')) {
-        techStack.add('Joomla');
+      // tech (Generator / CMS / builder)
+      if (lowerHtml.includes('wp-content')) techStackSet.add('WordPress');
+      if (lowerHtml.includes('wixstatic.com') || lowerHtml.includes('wixsite.com'))
+        techStackSet.add('Wix');
+      if (lowerHtml.includes('jimstatic.com') || lowerHtml.includes('jimdo'))
+        techStackSet.add('Jimdo');
+
+      // Extra tech signals
+      if (lowerHtml.includes('squarespace')) techStackSet.add('Squarespace');
+      if (lowerHtml.includes('shopify')) techStackSet.add('Shopify');
+
+      // Google Analytics / Tag Manager
+      if (
+        lowerHtml.includes('google-analytics.com') ||
+        lowerHtml.includes('gtag(') ||
+        lowerHtml.includes('gtm.js') ||
+        lowerHtml.includes('googletagmanager.com')
+      ) {
+        techStackSet.add('Google Analytics');
       }
 
-      // Framework Detection
-      if (lowerHtml.includes('react') || lowerHtml.includes('_react')) {
-        techStack.add('React');
-      }
-      if (lowerHtml.includes('vue') || lowerHtml.includes('__vue__')) {
-        techStack.add('Vue.js');
-      }
-      if (lowerHtml.includes('angular') || lowerHtml.includes('ng-version')) {
-        techStack.add('Angular');
-      }
-      if (lowerHtml.includes('next.js') || lowerHtml.includes('__next')) {
-        techStack.add('Next.js');
-      }
-
-      // Analytics & Marketing
-      if (lowerHtml.includes('google-analytics') || lowerHtml.includes('gtag(') || lowerHtml.includes('gtm.js')) {
-        techStack.add('Google Analytics');
-      }
-      if (lowerHtml.includes('matomo') || lowerHtml.includes('piwik')) {
-        techStack.add('Matomo');
-      }
-      if (lowerHtml.includes('facebook.com/tr') || lowerHtml.includes('fbq(')) {
-        techStack.add('Facebook Pixel');
-      }
-      if (lowerHtml.includes('hotjar')) {
-        techStack.add('Hotjar');
-      }
-
-      // SEO Analysis
-      const title = document.title?.trim() || '';
-      const metaDescription = document.querySelector('meta[name="description"]')?.getAttribute('content')?.trim() || '';
-      const metaKeywords = document.querySelector('meta[name="keywords"]')?.getAttribute('content')?.trim() || '';
-      const canonicalLink = document.querySelector('link[rel="canonical"]')?.href || '';
-      const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute('content') || '';
-      const ogDescription = document.querySelector('meta[property="og:description"]')?.getAttribute('content') || '';
-      const ogImage = document.querySelector('meta[property="og:image"]')?.getAttribute('content') || '';
-      
-      // Mobile responsiveness
+      const title = (document.title || '').trim();
+      const metaDescription =
+        document.querySelector('meta[name="description"]')?.getAttribute('content')?.trim() || '';
       const hasViewportMeta = Boolean(document.querySelector('meta[name="viewport"]'));
-      const viewportContent = document.querySelector('meta[name="viewport"]')?.getAttribute('content') || '';
-
-      // Heading structure
-      const h1Elements = Array.from(document.querySelectorAll('h1'));
-      const h1Count = h1Elements.length;
-      const h1Texts = h1Elements.map(h => h.textContent?.trim()).filter(Boolean);
-      const h2Count = document.querySelectorAll('h2').length;
-      const h3Count = document.querySelectorAll('h3').length;
-
-      // Images analysis
-      const images = Array.from(document.querySelectorAll('img'));
-      const imagesWithoutAlt = images.filter(img => !img.alt || img.alt.trim() === '').length;
-      const totalImages = images.length;
-
-      // Language detection
-      const htmlLang = document.documentElement.lang || '';
-
-      // Form detection (contact forms are crucial for SMEs)
-      const hasContactForm = document.querySelectorAll('form').length > 0;
-
-      // Performance indicators
-      const externalScripts = Array.from(document.querySelectorAll('script[src]')).length;
-      const inlineScripts = Array.from(document.querySelectorAll('script:not([src])')).length;
-      const stylesheets = Array.from(document.querySelectorAll('link[rel="stylesheet"]')).length;
+      const h1Count = document.querySelectorAll('h1').length;
 
       return {
-        // Legal
-        hasImpressumLink,
-        impressumUrl,
-        hasDatenschutzLink,
-        
-        // SEO
         title,
         metaDescription,
-        metaKeywords,
-        canonicalLink,
-        ogTitle,
-        ogDescription,
-        ogImage,
-        h1Count,
-        h1Texts,
-        h2Count,
-        h3Count,
-        
-        // Mobile
         hasViewportMeta,
-        viewportContent,
-        
-        // Accessibility
-        totalImages,
-        imagesWithoutAlt,
-        htmlLang,
-        
-        // Features
-        hasContactForm,
-        
-        // Performance
-        externalScripts,
-        inlineScripts,
-        stylesheets,
-        
-        // Tech
-        techStack: Array.from(techStack),
-
-        // STRICT AUDITOR: Quality Issues
-        deprecatedTags,
-        hasDeprecatedHTML,
-        bodyFontSize,
-        minFontSize,
-        hasTinyFonts,
+        hasImpressumLink,
+        h1Count,
+        techStack: Array.from(techStackSet),
       };
     });
 
-    console.log(`[EliteScanner] 📊 Page data extracted:`, {
-      title: pageData.title,
-      h1Count: pageData.h1Count,
-      hasImpressum: pageData.hasImpressumLink,
-      techStack: pageData.techStack,
-      hasDeprecatedHTML: pageData.hasDeprecatedHTML,
-      consoleErrors: qualityFindings.consoleErrors.length,
-      brokenResources: qualityFindings.brokenResources.length,
-    });
-
-    // ========================================================================
-    // STRICT AUDITOR: Mixed Content Detection (now that we have finalProtocol)
-    // ========================================================================
-    
-    if (finalProtocol === 'https:' && httpRequests.length > 0) {
-      qualityFindings.mixedContent = httpRequests;
-      console.log(`[StrictAuditor] ⚠️  Mixed content detected: ${httpRequests.length} HTTP resources on HTTPS page`);
-    }
-
-    // ========================================================================
-    // STEP 5: Issue Detection & Scoring (STRICT MODE)
-    // ========================================================================
-    
+    // 5) Scoring & issues
+    let score = 100;
     const issues = [];
-    let score = 100; // Start with perfect score
-    let hasOldSchoolHTML = false; // Track if we need to cap score at 50
-    
-    const applyPenalty = (amount, reason) => {
-      const oldScore = score;
+
+    const applyPenalty = (amount) => {
       score = Math.max(0, score - amount);
-      console.log(`[EliteScanner] 💯 Score: ${oldScore} → ${score} (-${amount}) | ${reason}`);
     };
 
-    // --- SECURITY CHECKS ---
-    
+    // security (SSL)
     if (finalProtocol !== 'https:') {
       issues.push(
-        buildIssue(
-          'security', 
-          'high',
-          'Keine SSL-Verschlüsselung',
-          'Webseite ist nicht verschlüsselt (kein HTTPS). Dies ist unsicher und schadet dem Vertrauen.'
-        )
+        buildIssue('security', 'high', 'Webseite ist nicht verschlüsselt (kein HTTPS).')
       );
-      applyPenalty(40, 'Missing HTTPS');
+      applyPenalty(40);
     }
 
-    // ========================================================================
-    // STRICT AUDITOR CHECKS - The "Mean" Detector
-    // ========================================================================
-
-    // --- 1. OLD SCHOOL HTML ARCHAEOLOGY (CRITICAL) ---
-    
-    if (pageData.hasDeprecatedHTML) {
-      hasOldSchoolHTML = true; // Cap score at 50
-      
-      const deprecatedDetails = [];
-      if (pageData.deprecatedTags.font > 0) deprecatedDetails.push(`<font> Tags (${pageData.deprecatedTags.font})`);
-      if (pageData.deprecatedTags.center > 0) deprecatedDetails.push(`<center> Tags (${pageData.deprecatedTags.center})`);
-      if (pageData.deprecatedTags.marquee > 0) deprecatedDetails.push(`<marquee> Tags (${pageData.deprecatedTags.marquee})`);
-      if (pageData.deprecatedTags.frameset > 0) deprecatedDetails.push(`<frameset> Tags (${pageData.deprecatedTags.frameset})`);
-      if (pageData.deprecatedTags.tableLayout > 0) deprecatedDetails.push(`Tabellen-Layout (${pageData.deprecatedTags.tableLayout})`);
-      
-      issues.push(
-        buildIssue(
-          'tech',
-          'critical',
-          'Veraltete Technik (HTML4/Tabellen-Layout)',
-          `Diese Seite ist technisch auf dem Stand von vor 10 Jahren. Gefunden: ${deprecatedDetails.join(', ')}. Diese Technik wird seit 2010 nicht mehr empfohlen.`
-        )
-      );
-      applyPenalty(30, 'Deprecated HTML tags');
-    }
-
-    // --- 2. CONSOLE ERRORS (JavaScript Defects) ---
-    
-    if (qualityFindings.consoleErrors.length > 0 || qualityFindings.pageErrors.length > 0) {
-      const totalErrors = qualityFindings.consoleErrors.length + qualityFindings.pageErrors.length;
-      const errorSamples = [
-        ...qualityFindings.pageErrors.slice(0, 2),
-        ...qualityFindings.consoleErrors.slice(0, 2)
-      ].map(err => err.substring(0, 100)).join('; ');
-      
-      issues.push(
-        buildIssue(
-          'tech',
-          'high',
-          'JavaScript-Fehler erkannt',
-          `${totalErrors} JavaScript-Fehler während des Ladens erkannt. Funktionen der Seite könnten defekt sein. Beispiele: ${errorSamples || 'Siehe Browser-Konsole'}`
-        )
-      );
-      applyPenalty(15, 'JavaScript errors');
-    }
-
-    // --- 3. TINY FONTS (Readability/Accessibility) ---
-    
-    if (pageData.hasTinyFonts) {
-      issues.push(
-        buildIssue(
-          'accessibility',
-          'medium',
-          'Schriftgröße zu klein',
-          `Schriftgröße ist zu klein (${Math.round(pageData.minFontSize)}px gefunden). Empfohlen sind mindestens 14-16px für gute Lesbarkeit auf Mobilgeräten.`
-        )
-      );
-      applyPenalty(10, 'Font size too small');
-    }
-
-    // --- 4. BROKEN RESOURCES (404 Errors) ---
-    
-    if (qualityFindings.brokenResources.length > 0) {
-      const brokenCount = qualityFindings.brokenResources.length;
-      const brokenTypes = [...new Set(qualityFindings.brokenResources.map(r => r.type))].join(', ');
-      const examples = qualityFindings.brokenResources.slice(0, 2)
-        .map(r => r.url.split('/').pop())
-        .join(', ');
-      
-      issues.push(
-        buildIssue(
-          'tech',
-          'high',
-          'Defekte Bilder oder Dateien',
-          `${brokenCount} Ressourcen konnten nicht geladen werden (404 Fehler). Typen: ${brokenTypes}. Beispiele: ${examples}`
-        )
-      );
-      applyPenalty(10, 'Broken resources (404)');
-    }
-
-    // --- 5. MIXED CONTENT (Security Risk on HTTPS) ---
-    
-    if (qualityFindings.mixedContent.length > 0) {
-      const mixedCount = qualityFindings.mixedContent.length;
-      const mixedTypes = [...new Set(qualityFindings.mixedContent.map(r => r.type))].join(', ');
-      
-      issues.push(
-        buildIssue(
-          'security',
-          'high',
-          'Unsichere Inhalte (Mixed Content)',
-          `${mixedCount} Ressourcen werden über unsicheres HTTP geladen, obwohl die Seite HTTPS nutzt. Das grüne Schloss im Browser verschwindet. Typen: ${mixedTypes}`
-        )
-      );
-      applyPenalty(20, 'Mixed content (HTTP on HTTPS)');
-    }
-
-    // --- MOBILE CHECKS ---
-    
+    // mobile (Viewport)
     if (!pageData.hasViewportMeta) {
       issues.push(
-        buildIssue(
-          'mobile', 
-          'high',
-          'Nicht mobile-optimiert',
-          'Kein responsiver Viewport-Meta-Tag gefunden. Webseite ist nicht für Mobilgeräte optimiert.'
-        )
+        buildIssue('mobile', 'high', 'Kein responsiver Viewport-Meta-Tag gefunden.')
       );
-      applyPenalty(20, 'No viewport meta tag');
-    } else if (!pageData.viewportContent.includes('width=device-width')) {
-      issues.push(
-        buildIssue(
-          'mobile', 
-          'medium',
-          'Viewport-Konfiguration suboptimal',
-          'Viewport-Meta-Tag ist nicht optimal konfiguriert.'
-        )
-      );
-      applyPenalty(5, 'Suboptimal viewport config');
+      applyPenalty(20);
     }
 
-    // --- LEGAL COMPLIANCE CHECKS (CRITICAL FOR GERMANY/EU) ---
-    
+    // legal (Impressum)
     if (!pageData.hasImpressumLink) {
       issues.push(
-        buildIssue(
-          'legal', 
-          'critical',
-          'Impressum fehlt',
-          'Kein Impressum-Link gefunden. Dies ist in Deutschland gesetzlich vorgeschrieben (§5 TMG)!'
-        )
+        buildIssue('legal', 'critical', 'Kein Impressum-Link gefunden.')
       );
-      applyPenalty(30, 'Missing Impressum');
+      applyPenalty(30);
     }
 
-    if (!pageData.hasDatenschutzLink) {
-      issues.push(
-        buildIssue(
-          'legal', 
-          'high',
-          'Datenschutzerklärung fehlt',
-          'Kein Datenschutz-Link gefunden. DSGVO-Verstoß!'
-        )
-      );
-      applyPenalty(15, 'Missing Privacy Policy');
-    }
-
-    // --- GDPR VIOLATION CHECKS ---
-    
+    // gdpr (Google Fonts)
     if (gdprFindings.googleFonts) {
       issues.push(
         buildIssue(
-          'gdpr', 
+          'gdpr',
           'high',
-          'Google Fonts werden illegal geladen',
-          'Ihre Seite lädt Schriften direkt von US-Servern. Das verstößt gegen die DSGVO (EuGH-Urteil). Schriftarten sollten lokal gehostet werden.'
+          'Google Fonts werden extern geladen (mögliche DSGVO-Verletzung).'
         )
       );
-      applyPenalty(20, 'Google Fonts GDPR violation');
+      applyPenalty(20);
     }
 
+    // gdpr (Google Maps) – informational for now
     if (gdprFindings.googleMaps) {
       issues.push(
-        buildIssue(
-          'gdpr', 
-          'medium',
-          'Google Maps ohne Consent',
-          'Google Maps wird ohne Consent-Management eingebunden. Möglicher DSGVO-Verstoß.'
-        )
+        buildIssue('gdpr', 'medium', 'Google Maps wird extern eingebunden.')
       );
-      applyPenalty(10, 'Google Maps without consent');
     }
 
-    if (gdprFindings.googleAnalytics) {
+    // seo (Title)
+    if (!pageData.title || pageData.title.length < 10) {
+      const lengthInfo = pageData.title ? ` (${pageData.title.length} Zeichen)` : '';
       issues.push(
-        buildIssue(
-          'gdpr', 
-          'medium',
-          'Google Analytics erkannt',
-          'Google Analytics erkannt. Stellen Sie sicher, dass ein Cookie-Banner aktiv ist.'
-        )
+        buildIssue('seo', 'medium', `Seitentitel fehlt oder ist zu kurz${lengthInfo}.`)
       );
-      applyPenalty(5, 'Google Analytics detected');
+      applyPenalty(5);
     }
 
-    if (gdprFindings.facebookPixel) {
-      issues.push(
-        buildIssue(
-          'gdpr', 
-          'medium',
-          'Facebook Pixel erkannt',
-          'Facebook Pixel erkannt. Benötigt explizite Nutzereinwilligung (DSGVO).'
-        )
-      );
-      applyPenalty(5, 'Facebook Pixel detected');
-    }
-
-    // --- SEO CHECKS ---
-    
-    // Title check
-    if (!pageData.title) {
-      issues.push(
-        buildIssue(
-          'seo', 
-          'medium',
-          'Seitentitel fehlt',
-          'Seitentitel fehlt komplett. Wichtig für Suchmaschinen!'
-        )
-      );
-      applyPenalty(5, 'Missing title');
-    } else if (pageData.title.length < 10) {
-      issues.push(
-        buildIssue(
-          'seo', 
-          'medium',
-          'Seitentitel zu kurz',
-          `Seitentitel ist zu kurz (${pageData.title.length} Zeichen). Empfohlen: 50-60 Zeichen.`
-        )
-      );
-      applyPenalty(5, 'Title too short');
-    } else if (pageData.title.length > 70) {
-      issues.push(
-        buildIssue(
-          'seo', 
-          'low',
-          'Seitentitel zu lang',
-          `Seitentitel ist zu lang (${pageData.title.length} Zeichen). Google kürzt nach ~60 Zeichen.`
-        )
-      );
-      applyPenalty(3, 'Title too long');
-    }
-
-    // Meta description check
+    // seo (Description)
     if (!pageData.metaDescription) {
       issues.push(
-        buildIssue(
-          'seo', 
-          'medium',
-          'Meta-Description fehlt',
-          'Meta-Description fehlt. Wichtig für Suchergebnisse!'
-        )
+        buildIssue('seo', 'medium', 'Meta-Description fehlt.')
       );
-      applyPenalty(5, 'Missing meta description');
-    } else if (pageData.metaDescription.length < 50) {
+      applyPenalty(5);
+    }
+
+    // seo (Headings / H1 count)
+    if (pageData.h1Count === 0 || pageData.h1Count > 1) {
       issues.push(
-        buildIssue(
-          'seo', 
-          'low',
-          'Meta-Description zu kurz',
-          `Meta-Description ist zu kurz (${pageData.metaDescription.length} Zeichen). Empfohlen: 150-160 Zeichen.`
-        )
+        buildIssue('seo', 'medium', `H1-Struktur fehlerhaft (gefunden: ${pageData.h1Count}).`)
       );
-      applyPenalty(3, 'Meta description too short');
+      applyPenalty(5);
     }
 
-    // H1 structure check
-    if (pageData.h1Count === 0) {
-      issues.push(
-        buildIssue(
-          'seo', 
-          'medium',
-          'H1-Überschrift fehlt',
-          'Keine H1-Überschrift gefunden. Wichtig für SEO-Struktur!'
-        )
-      );
-      applyPenalty(5, 'Missing H1');
-    } else if (pageData.h1Count > 1) {
-      issues.push(
-        buildIssue(
-          'seo', 
-          'medium',
-          'Mehrere H1-Überschriften',
-          `Mehrere H1-Überschriften gefunden (${pageData.h1Count}). Es sollte nur eine H1 pro Seite geben.`
-        )
-      );
-      applyPenalty(5, 'Multiple H1 tags');
-    }
-
-    // Language tag check
-    if (!pageData.htmlLang) {
-      issues.push(
-        buildIssue(
-          'seo', 
-          'low',
-          'Sprachattribut fehlt',
-          'HTML-Sprachattribut fehlt. Sollte gesetzt werden für bessere Barrierefreiheit.'
-        )
-      );
-      applyPenalty(2, 'Missing language tag');
-    }
-
-    // Open Graph check (important for social media sharing)
-    if (!pageData.ogTitle && !pageData.ogDescription) {
-      issues.push(
-        buildIssue(
-          'seo', 
-          'low',
-          'Open Graph Tags fehlen',
-          'Open Graph Tags fehlen. Wichtig für Social Media Sharing (Facebook, LinkedIn).'
-        )
-      );
-      applyPenalty(3, 'Missing Open Graph tags');
-    }
-
-    // --- ACCESSIBILITY CHECKS ---
-    
-    if (pageData.totalImages > 0 && pageData.imagesWithoutAlt > 0) {
-      const percentage = Math.round((pageData.imagesWithoutAlt / pageData.totalImages) * 100);
-      issues.push(
-        buildIssue(
-          'accessibility', 
-          'medium',
-          'Bilder ohne Alt-Text',
-          `${pageData.imagesWithoutAlt} von ${pageData.totalImages} Bildern haben keinen Alt-Text (${percentage}%). Wichtig für Barrierefreiheit!`
-        )
-      );
-      applyPenalty(5, 'Images without alt text');
-    }
-
-    // --- PERFORMANCE WARNINGS (informational, minor penalties) ---
-    
-    if (pageData.externalScripts > 10) {
-      issues.push(
-        buildIssue(
-          'performance', 
-          'low',
-          'Viele externe Skripte',
-          `Viele externe Skripte (${pageData.externalScripts}). Dies kann die Ladezeit verlangsamen.`
-        )
-      );
-      applyPenalty(2, 'Many external scripts');
-    }
-
-    // --- POSITIVE FINDINGS (no penalty, but good to mention) ---
-    
-    if (pageData.hasContactForm) {
-      console.log('[EliteScanner] ✅ Contact form detected');
-    }
-
-    if (pageData.canonicalLink) {
-      console.log('[EliteScanner] ✅ Canonical link present');
-    }
-
-    // ========================================================================
-    // STRICT AUDITOR: Final Score Adjustment
-    // ========================================================================
-    
-    // If old school HTML detected, MAX score is 50 (website is fundamentally outdated)
-    if (hasOldSchoolHTML && score > 50) {
-      const scoreBefore = score;
-      score = 50;
-      console.log(`[StrictAuditor] ⚠️  Score capped at 50 due to deprecated HTML (was ${scoreBefore})`);
-      
-      // Add additional warning
-      issues.push(
-        buildIssue(
-          'tech',
-          'critical',
-          'Score auf 50 begrenzt',
-          'Aufgrund der veralteten HTML-Technik wurde der Score auf maximal 50 Punkte begrenzt. Eine technische Überarbeitung ist dringend empfohlen.'
-        )
-      );
-    }
-
-    console.log(`[EliteScanner] 📊 Final Score: ${score}/100 | Issues: ${issues.length}`);
-
-    // ========================================================================
-    // STEP 6: Screenshot Capture
-    // ========================================================================
-    
-    let screenshotDataUrl = null;
+    // 6) Optional screenshot of top page (base64)
+    let screenshotBase64 = null;
     try {
       const screenshotBuffer = await page.screenshot({
-        fullPage: false, // Only capture "above the fold" viewport
+        fullPage: false,
         type: 'jpeg',
         quality: 60,
-        timeout: 10000, // 10s timeout for screenshot
       });
-      const base64String = screenshotBuffer.toString('base64');
-      screenshotDataUrl = `data:image/jpeg;base64,${base64String}`;
-      console.log('[EliteScanner] 📸 Screenshot captured successfully');
-    } catch (shotError) {
-      console.warn('[EliteScanner] ⚠️  Screenshot failed:', shotError.message);
-      // Don't fail the scan if screenshot fails
+      screenshotBase64 = screenshotBuffer.toString('base64');
+    } catch (screenshotError) {
+      console.warn('[EliteScanner] Screenshot failed:', screenshotError.message);
     }
 
-    // ========================================================================
-    // STEP 7: Final Tech Stack Compilation
-    // ========================================================================
-    
-    const techStack = Array.from(new Set([
-      ...pageData.techStack,
-      ...(gdprFindings.googleAnalytics ? ['Google Analytics'] : []),
-      ...(gdprFindings.facebookPixel ? ['Facebook Pixel'] : []),
-    ]));
+    const techStack = Array.from(new Set(pageData.techStack || []));
 
-    // ========================================================================
-    // STEP 8: Response Compilation (Exact Format)
-    // ========================================================================
-    
-    const scanDuration = Date.now() - scanStartTime;
-    console.log(`[EliteScanner] ✅ Scan completed in ${scanDuration}ms | Score: ${score}/100`);
-
-    const response = {
+    return {
       url: targetUrl.href,
       finalUrl,
       score,
-      screenshot: screenshotDataUrl,
-      meta: {
-        title: pageData.title || '',
-        description: pageData.metaDescription || '',
-      },
-      techStack,
+      screenshot: screenshotBase64,
       issues,
+      techStack,
     };
-
-    res.json(response);
-
-  } catch (error) {
-    // ========================================================================
-    // ERROR HANDLING - Never crash the server
-    // ========================================================================
-    
-    console.error('[EliteScanner] ❌ SCAN FAILED:', error);
-    
-    const errorResponse = {
-      error: 'Scan failed',
-      message: error.message || 'Unknown error occurred',
-      url: req.body?.url || 'unknown',
-      timestamp: new Date().toISOString(),
-    };
-
-    // Determine appropriate status code
-    if (error.message?.includes('timeout') || error.message?.includes('Timeout')) {
-      errorResponse.code = 'TIMEOUT';
-      return res.status(504).json(errorResponse);
-    } else if (error.message?.includes('net::ERR')) {
-      errorResponse.code = 'NETWORK_ERROR';
-      return res.status(503).json(errorResponse);
-    } else {
-      errorResponse.code = 'INTERNAL_ERROR';
-      return res.status(500).json(errorResponse);
-    }
-
   } finally {
-    // ========================================================================
-    // CLEANUP - Always close browser
-    // ========================================================================
-    
     if (browser) {
       try {
         await browser.close();
-        console.log('[EliteScanner] 🧹 Browser closed');
       } catch (closeError) {
-        console.error('[EliteScanner] ⚠️  Browser close error:', closeError.message);
+        console.error('[EliteScanner] Browser close error:', closeError);
       }
     }
   }
+}
+
+/**
+ * Content harvester - extracts all content for website relaunch
+ */
+async function harvestContent(inputUrl) {
+  let browser;
+
+  try {
+    const targetUrl = normalizeUrl(inputUrl);
+    console.log(`[ContentHarvester] Starting harvest for ${targetUrl.href}`);
+
+    browser = await chromium.launch({
+      headless: true,
+      args: HEADLESS_ARGS,
+    });
+
+    const context = await browser.newContext({
+      viewport: { width: 1920, height: 1080 },
+      userAgent: USER_AGENT,
+    });
+
+    const page = await context.newPage();
+    page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
+
+    // Navigate to the page
+    try {
+      await page.goto(targetUrl.href, {
+        waitUntil: 'domcontentloaded',
+        timeout: DEFAULT_TIMEOUT_MS,
+      });
+      await page.waitForLoadState('networkidle', { timeout: DEFAULT_TIMEOUT_MS }).catch(() => {
+        // networkidle might never fire – that's OK
+      });
+    } catch {
+      throw new Error('Target site unreachable or timed out.');
+    }
+
+    // Extract all content in browser context
+    const extractedData = await page.evaluate(() => {
+      // Helper: Extract emails from text
+      function extractEmails(text) {
+        const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
+        const matches = text.match(emailRegex) || [];
+        return [...new Set(matches)]; // Remove duplicates
+      }
+
+      // Helper: Extract phone numbers (German and international formats)
+      function extractPhones(text) {
+        const phoneRegex = /(\+?\d{1,4}[\s-]?)?\(?\d{2,4}\)?[\s-]?\d{3,4}[\s-]?\d{3,4}/g;
+        const matches = text.match(phoneRegex) || [];
+        // Filter out obvious false positives (like years)
+        return [...new Set(matches.filter(p => p.replace(/\D/g, '').length >= 8))];
+      }
+
+      // Meta information
+      const title = (document.title || '').trim();
+      const metaDescription =
+        document.querySelector('meta[name="description"]')?.getAttribute('content')?.trim() || '';
+
+      // Get all text content for email/phone extraction
+      const bodyText = document.body?.innerText || '';
+      
+      // Also check mailto links for emails
+      const mailtoLinks = Array.from(document.querySelectorAll('a[href^="mailto:"]'));
+      const mailtoEmails = mailtoLinks.map(a => {
+        const href = a.getAttribute('href') || '';
+        return href.replace('mailto:', '').split('?')[0];
+      }).filter(Boolean);
+
+      // Also check tel links for phones
+      const telLinks = Array.from(document.querySelectorAll('a[href^="tel:"]'));
+      const telPhones = telLinks.map(a => {
+        const href = a.getAttribute('href') || '';
+        return href.replace('tel:', '').trim();
+      }).filter(Boolean);
+
+      // Combine extracted contact info
+      const emails = [...new Set([...extractEmails(bodyText), ...mailtoEmails])];
+      const phones = [...new Set([...extractPhones(bodyText), ...telPhones])];
+
+      // Extract headings
+      const h1Texts = Array.from(document.querySelectorAll('h1'))
+        .map(h => h.innerText?.trim())
+        .filter(Boolean);
+      const h2Texts = Array.from(document.querySelectorAll('h2'))
+        .map(h => h.innerText?.trim())
+        .filter(Boolean);
+      const h3Texts = Array.from(document.querySelectorAll('h3'))
+        .map(h => h.innerText?.trim())
+        .filter(Boolean);
+
+      const headlines = [...h1Texts, ...h2Texts, ...h3Texts];
+
+      // Extract images (filter small icons, get dimensions)
+      const images = Array.from(document.querySelectorAll('img'))
+        .map(img => {
+          const src = img.src;
+          const width = img.naturalWidth || img.width || 0;
+          const height = img.naturalHeight || img.height || 0;
+          const alt = img.alt || '';
+          
+          return { src, width, height, alt, area: width * height };
+        })
+        .filter(img => {
+          // Filter out small icons (< 200px in either dimension)
+          return img.width >= 200 && img.height >= 200;
+        })
+        .sort((a, b) => b.area - a.area) // Sort by area (largest first)
+        .slice(0, 5) // Take top 5
+        .map(img => img.src);
+
+      // Extract social media links
+      const links = Array.from(document.querySelectorAll('a'));
+      const socials = [];
+      
+      links.forEach(a => {
+        const href = a.href?.toLowerCase() || '';
+        if (href.includes('facebook.com/') && !href.includes('/sharer')) {
+          socials.push({ platform: 'Facebook', url: a.href });
+        } else if (href.includes('instagram.com/')) {
+          socials.push({ platform: 'Instagram', url: a.href });
+        } else if (href.includes('linkedin.com/')) {
+          socials.push({ platform: 'LinkedIn', url: a.href });
+        } else if (href.includes('twitter.com/') || href.includes('x.com/')) {
+          socials.push({ platform: 'Twitter', url: a.href });
+        } else if (href.includes('youtube.com/') || href.includes('youtu.be/')) {
+          socials.push({ platform: 'YouTube', url: a.href });
+        } else if (href.includes('xing.com/')) {
+          socials.push({ platform: 'XING', url: a.href });
+        }
+      });
+
+      // Remove duplicate socials
+      const uniqueSocials = [];
+      const seenUrls = new Set();
+      socials.forEach(social => {
+        if (!seenUrls.has(social.url)) {
+          seenUrls.add(social.url);
+          uniqueSocials.push(social);
+        }
+      });
+
+      // Get main body text (cleaned)
+      let rawText = bodyText;
+      
+      // Try to remove header/footer/nav text for cleaner content
+      try {
+        const mainContent = 
+          document.querySelector('main') ||
+          document.querySelector('article') ||
+          document.querySelector('[role="main"]') ||
+          document.querySelector('.content') ||
+          document.querySelector('#content') ||
+          document.body;
+        
+        if (mainContent) {
+          rawText = mainContent.innerText || bodyText;
+        }
+      } catch {
+        // Fallback to body text
+      }
+
+      // Trim to first 2000 chars
+      const trimmedText = rawText.substring(0, 2000);
+
+      return {
+        meta: {
+          title,
+          description: metaDescription,
+        },
+        contact: {
+          emails,
+          phones,
+        },
+        socials: uniqueSocials,
+        headlines,
+        images,
+        rawText: trimmedText,
+      };
+    });
+
+    console.log(`[ContentHarvester] Extracted: ${extractedData.headlines.length} headlines, ${extractedData.images.length} images, ${extractedData.contact.emails.length} emails`);
+
+    return {
+      status: 'success',
+      ...extractedData,
+    };
+
+  } finally {
+    if (browser) {
+      try {
+        await browser.close();
+      } catch (closeError) {
+        console.error('[ContentHarvester] Browser close error:', closeError);
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Routes
+// ---------------------------------------------------------------------------
+
+app.get('/health', (_req, res) => {
+  res.json({ status: 'ok', service: 'sitesweep-scanner' });
 });
 
-// ============================================================================
-// SERVER STARTUP
-// ============================================================================
+app.post('/scan', async (req, res) => {
+  try {
+    const url = req.body && req.body.url;
+
+    const result = await withTimeout(
+      performScan(url),
+      DEFAULT_TIMEOUT_MS,
+      'Scan timeout after 30 seconds.'
+    );
+
+    res.json(result);
+  } catch (error) {
+    console.error('[EliteScanner] Scan failed:', error);
+
+    const message = error && error.message ? error.message : 'Scan failed';
+    const isUserError =
+      message.includes('URL is required') ||
+      message.includes('Invalid URL') ||
+      message.includes('Only HTTP/HTTPS protocols are allowed.');
+
+    const status = isUserError
+      ? 400
+      : message.includes('unreachable') || message.includes('timeout')
+      ? 502
+      : 500;
+
+    res.status(status).json({ error: message });
+  }
+});
+
+app.post('/harvest', async (req, res) => {
+  try {
+    const url = req.body && req.body.url;
+
+    const result = await withTimeout(
+      harvestContent(url),
+      DEFAULT_TIMEOUT_MS,
+      'Harvest timeout after 30 seconds.'
+    );
+
+    res.json(result);
+  } catch (error) {
+    console.error('[ContentHarvester] Harvest failed:', error);
+
+    const message = error && error.message ? error.message : 'Harvest failed';
+    const isUserError =
+      message.includes('URL is required') ||
+      message.includes('Invalid URL') ||
+      message.includes('Only HTTP/HTTPS protocols are allowed.');
+
+    const status = isUserError
+      ? 400
+      : message.includes('unreachable') || message.includes('timeout')
+      ? 502
+      : 500;
+
+    res.status(status).json({ error: message });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Server lifecycle
+// ---------------------------------------------------------------------------
 
 app.listen(PORT, () => {
-  console.log('═══════════════════════════════════════════════════════════');
-  console.log('🚀 ELITE SCANNER SERVICE');
-  console.log('═══════════════════════════════════════════════════════════');
-  console.log(`📡 Server listening on port: ${PORT}`);
-  console.log(`⏱️  Timeout: ${DEFAULT_TIMEOUT_MS}ms`);
-  console.log(`🌐 CORS: ${process.env.FRONTEND_URL || 'All origins'}`);
-  console.log('═══════════════════════════════════════════════════════════');
+  console.log(`[EliteScanner] Server listening on port ${PORT}`);
 });
 
-// ============================================================================
-// GRACEFUL SHUTDOWN
-// ============================================================================
-
 process.on('SIGTERM', () => {
-  console.log('[EliteScanner] 🛑 SIGTERM received, shutting down gracefully...');
+  console.log('[EliteScanner] SIGTERM received, shutting down.');
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  console.log('[EliteScanner] 🛑 SIGINT received, shutting down gracefully...');
+  console.log('[EliteScanner] SIGINT received, shutting down.');
   process.exit(0);
-});
-
-// ============================================================================
-// UNHANDLED ERRORS - Log but don't crash
-// ============================================================================
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('[EliteScanner] ⚠️  Unhandled Promise Rejection:', reason);
-});
-
-process.on('uncaughtException', (error) => {
-  console.error('[EliteScanner] ⚠️  Uncaught Exception:', error);
-  // In production, you might want to exit here, but for now we log and continue
 });
