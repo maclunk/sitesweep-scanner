@@ -75,11 +75,12 @@ const normalizeUrl = (rawUrl = '') => {
 };
 
 /**
- * Creates a standardized issue object
+ * Creates a standardized issue object with title and message
  */
-const buildIssue = (category, severity, message) => ({
+const buildIssue = (category, severity, title, message) => ({
   category,
   severity,
+  title,
   message,
 });
 
@@ -415,7 +416,8 @@ app.post('/scan', async (req, res) => {
       issues.push(
         buildIssue(
           'security', 
-          'high', 
+          'high',
+          'Keine SSL-Verschlüsselung',
           'Webseite ist nicht verschlüsselt (kein HTTPS). Dies ist unsicher und schadet dem Vertrauen.'
         )
       );
@@ -428,7 +430,8 @@ app.post('/scan', async (req, res) => {
       issues.push(
         buildIssue(
           'mobile', 
-          'high', 
+          'high',
+          'Nicht mobile-optimiert',
           'Kein responsiver Viewport-Meta-Tag gefunden. Webseite ist nicht für Mobilgeräte optimiert.'
         )
       );
@@ -437,7 +440,8 @@ app.post('/scan', async (req, res) => {
       issues.push(
         buildIssue(
           'mobile', 
-          'medium', 
+          'medium',
+          'Viewport-Konfiguration suboptimal',
           'Viewport-Meta-Tag ist nicht optimal konfiguriert.'
         )
       );
@@ -450,7 +454,8 @@ app.post('/scan', async (req, res) => {
       issues.push(
         buildIssue(
           'legal', 
-          'critical', 
+          'critical',
+          'Impressum fehlt',
           'Kein Impressum-Link gefunden. Dies ist in Deutschland gesetzlich vorgeschrieben (§5 TMG)!'
         )
       );
@@ -461,7 +466,8 @@ app.post('/scan', async (req, res) => {
       issues.push(
         buildIssue(
           'legal', 
-          'high', 
+          'high',
+          'Datenschutzerklärung fehlt',
           'Kein Datenschutz-Link gefunden. DSGVO-Verstoß!'
         )
       );
@@ -474,8 +480,9 @@ app.post('/scan', async (req, res) => {
       issues.push(
         buildIssue(
           'gdpr', 
-          'high', 
-          'Google Fonts werden extern geladen. DSGVO-Verstoß nach EuGH-Urteil! Schriftarten sollten lokal gehostet werden.'
+          'high',
+          'Google Fonts werden illegal geladen',
+          'Ihre Seite lädt Schriften direkt von US-Servern. Das verstößt gegen die DSGVO (EuGH-Urteil). Schriftarten sollten lokal gehostet werden.'
         )
       );
       applyPenalty(20, 'Google Fonts GDPR violation');
@@ -485,7 +492,8 @@ app.post('/scan', async (req, res) => {
       issues.push(
         buildIssue(
           'gdpr', 
-          'medium', 
+          'medium',
+          'Google Maps ohne Consent',
           'Google Maps wird ohne Consent-Management eingebunden. Möglicher DSGVO-Verstoß.'
         )
       );
@@ -496,7 +504,8 @@ app.post('/scan', async (req, res) => {
       issues.push(
         buildIssue(
           'gdpr', 
-          'medium', 
+          'medium',
+          'Google Analytics erkannt',
           'Google Analytics erkannt. Stellen Sie sicher, dass ein Cookie-Banner aktiv ist.'
         )
       );
@@ -507,7 +516,8 @@ app.post('/scan', async (req, res) => {
       issues.push(
         buildIssue(
           'gdpr', 
-          'medium', 
+          'medium',
+          'Facebook Pixel erkannt',
           'Facebook Pixel erkannt. Benötigt explizite Nutzereinwilligung (DSGVO).'
         )
       );
@@ -519,14 +529,20 @@ app.post('/scan', async (req, res) => {
     // Title check
     if (!pageData.title) {
       issues.push(
-        buildIssue('seo', 'medium', 'Seitentitel fehlt komplett.')
+        buildIssue(
+          'seo', 
+          'medium',
+          'Seitentitel fehlt',
+          'Seitentitel fehlt komplett. Wichtig für Suchmaschinen!'
+        )
       );
       applyPenalty(5, 'Missing title');
     } else if (pageData.title.length < 10) {
       issues.push(
         buildIssue(
           'seo', 
-          'medium', 
+          'medium',
+          'Seitentitel zu kurz',
           `Seitentitel ist zu kurz (${pageData.title.length} Zeichen). Empfohlen: 50-60 Zeichen.`
         )
       );
@@ -535,7 +551,8 @@ app.post('/scan', async (req, res) => {
       issues.push(
         buildIssue(
           'seo', 
-          'low', 
+          'low',
+          'Seitentitel zu lang',
           `Seitentitel ist zu lang (${pageData.title.length} Zeichen). Google kürzt nach ~60 Zeichen.`
         )
       );
@@ -545,14 +562,20 @@ app.post('/scan', async (req, res) => {
     // Meta description check
     if (!pageData.metaDescription) {
       issues.push(
-        buildIssue('seo', 'medium', 'Meta-Description fehlt. Wichtig für Suchergebnisse!')
+        buildIssue(
+          'seo', 
+          'medium',
+          'Meta-Description fehlt',
+          'Meta-Description fehlt. Wichtig für Suchergebnisse!'
+        )
       );
       applyPenalty(5, 'Missing meta description');
     } else if (pageData.metaDescription.length < 50) {
       issues.push(
         buildIssue(
           'seo', 
-          'low', 
+          'low',
+          'Meta-Description zu kurz',
           `Meta-Description ist zu kurz (${pageData.metaDescription.length} Zeichen). Empfohlen: 150-160 Zeichen.`
         )
       );
@@ -562,14 +585,20 @@ app.post('/scan', async (req, res) => {
     // H1 structure check
     if (pageData.h1Count === 0) {
       issues.push(
-        buildIssue('seo', 'medium', 'Keine H1-Überschrift gefunden. Wichtig für SEO-Struktur!')
+        buildIssue(
+          'seo', 
+          'medium',
+          'H1-Überschrift fehlt',
+          'Keine H1-Überschrift gefunden. Wichtig für SEO-Struktur!'
+        )
       );
       applyPenalty(5, 'Missing H1');
     } else if (pageData.h1Count > 1) {
       issues.push(
         buildIssue(
           'seo', 
-          'medium', 
+          'medium',
+          'Mehrere H1-Überschriften',
           `Mehrere H1-Überschriften gefunden (${pageData.h1Count}). Es sollte nur eine H1 pro Seite geben.`
         )
       );
@@ -579,7 +608,12 @@ app.post('/scan', async (req, res) => {
     // Language tag check
     if (!pageData.htmlLang) {
       issues.push(
-        buildIssue('seo', 'low', 'HTML-Sprachattribut fehlt. Sollte gesetzt werden für bessere Barrierefreiheit.')
+        buildIssue(
+          'seo', 
+          'low',
+          'Sprachattribut fehlt',
+          'HTML-Sprachattribut fehlt. Sollte gesetzt werden für bessere Barrierefreiheit.'
+        )
       );
       applyPenalty(2, 'Missing language tag');
     }
@@ -589,7 +623,8 @@ app.post('/scan', async (req, res) => {
       issues.push(
         buildIssue(
           'seo', 
-          'low', 
+          'low',
+          'Open Graph Tags fehlen',
           'Open Graph Tags fehlen. Wichtig für Social Media Sharing (Facebook, LinkedIn).'
         )
       );
@@ -603,7 +638,8 @@ app.post('/scan', async (req, res) => {
       issues.push(
         buildIssue(
           'accessibility', 
-          'medium', 
+          'medium',
+          'Bilder ohne Alt-Text',
           `${pageData.imagesWithoutAlt} von ${pageData.totalImages} Bildern haben keinen Alt-Text (${percentage}%). Wichtig für Barrierefreiheit!`
         )
       );
@@ -616,7 +652,8 @@ app.post('/scan', async (req, res) => {
       issues.push(
         buildIssue(
           'performance', 
-          'low', 
+          'low',
+          'Viele externe Skripte',
           `Viele externe Skripte (${pageData.externalScripts}). Dies kann die Ladezeit verlangsamen.`
         )
       );
@@ -637,15 +674,16 @@ app.post('/scan', async (req, res) => {
     // STEP 6: Screenshot Capture
     // ========================================================================
     
-    let screenshotBase64 = null;
+    let screenshotDataUrl = null;
     try {
       const screenshotBuffer = await page.screenshot({
-        fullPage: false, // Only capture viewport for speed
+        fullPage: false, // Only capture "above the fold" viewport
         type: 'jpeg',
         quality: 60,
         timeout: 10000, // 10s timeout for screenshot
       });
-      screenshotBase64 = screenshotBuffer.toString('base64');
+      const base64String = screenshotBuffer.toString('base64');
+      screenshotDataUrl = `data:image/jpeg;base64,${base64String}`;
       console.log('[EliteScanner] 📸 Screenshot captured successfully');
     } catch (shotError) {
       console.warn('[EliteScanner] ⚠️  Screenshot failed:', shotError.message);
@@ -663,7 +701,7 @@ app.post('/scan', async (req, res) => {
     ]));
 
     // ========================================================================
-    // STEP 8: Response Compilation
+    // STEP 8: Response Compilation (Exact Format)
     // ========================================================================
     
     const scanDuration = Date.now() - scanStartTime;
@@ -673,15 +711,13 @@ app.post('/scan', async (req, res) => {
       url: targetUrl.href,
       finalUrl,
       score,
-      screenshot: screenshotBase64,
-      issues,
-      techStack,
-      metadata: {
-        scanDuration: `${scanDuration}ms`,
-        timestamp: new Date().toISOString(),
-        pageTitle: pageData.title,
-        ...(navigationError && { navigationWarning: navigationError }),
+      screenshot: screenshotDataUrl,
+      meta: {
+        title: pageData.title || '',
+        description: pageData.metaDescription || '',
       },
+      techStack,
+      issues,
     };
 
     res.json(response);
