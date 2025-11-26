@@ -152,6 +152,14 @@ app.post('/scan', async (req, res) => {
       facebookPixel: false,
     };
 
+    // STRICT AUDITOR: Track quality issues
+    const qualityFindings = {
+      brokenResources: [],
+      mixedContent: [],
+      consoleErrors: [],
+      pageErrors: [],
+    };
+
     const requestUrls = [];
 
     // Intercept ALL network requests to detect GDPR violations
@@ -198,6 +206,49 @@ app.post('/scan', async (req, res) => {
     const page = await context.newPage();
     page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
 
+    // ========================================================================
+    // STRICT AUDITOR: Error & Quality Monitoring
+    // ========================================================================
+
+    // Listen for console errors (JavaScript errors)
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') {
+        qualityFindings.consoleErrors.push(msg.text());
+        console.log('[StrictAuditor] 🔴 Console error:', msg.text().substring(0, 100));
+      }
+    });
+
+    // Listen for page errors (uncaught exceptions)
+    page.on('pageerror', (error) => {
+      qualityFindings.pageErrors.push(error.message);
+      console.log('[StrictAuditor] ❌ Page error:', error.message.substring(0, 100));
+    });
+
+    // Track all HTTP requests for mixed content detection
+    const httpRequests = [];
+    
+    // Listen for failed network requests (404s, broken resources) and track HTTP requests
+    page.on('response', async (response) => {
+      try {
+        const status = response.status();
+        const url = response.url();
+        const resourceType = response.request().resourceType();
+
+        // Track HTTP requests for later mixed content analysis
+        if (url.startsWith('http://') && ['image', 'stylesheet', 'script', 'font'].includes(resourceType)) {
+          httpRequests.push({ url, type: resourceType });
+        }
+
+        // Detect 404s on images, stylesheets, scripts
+        if (status === 404 && ['image', 'stylesheet', 'script', 'font'].includes(resourceType)) {
+          qualityFindings.brokenResources.push({ url, status, type: resourceType });
+          console.log(`[StrictAuditor] 💔 Broken resource (404): ${resourceType} - ${url.substring(0, 80)}`);
+        }
+      } catch (err) {
+        // Ignore errors in response handler
+      }
+    });
+
     let navigationError = null;
     
     try {
@@ -242,7 +293,65 @@ app.post('/scan', async (req, res) => {
       const lowerHtml = html.toLowerCase();
       const bodyText = document.body?.textContent || '';
       
+      // ========================================================================
+      // STRICT AUDITOR: "Old School" HTML Archaeology
+      // ========================================================================
+      
+      const deprecatedTags = {
+        font: document.querySelectorAll('font').length,
+        center: document.querySelectorAll('center').length,
+        frameset: document.querySelectorAll('frameset').length,
+        marquee: document.querySelectorAll('marquee').length,
+        // Tables used for layout (with border attribute, old-school way)
+        tableLayout: Array.from(document.querySelectorAll('table[border]')).filter(
+          table => !table.closest('[role="table"]') // Exclude proper semantic tables
+        ).length,
+      };
+      
+      const hasDeprecatedHTML = 
+        deprecatedTags.font > 0 || 
+        deprecatedTags.center > 0 || 
+        deprecatedTags.frameset > 0 || 
+        deprecatedTags.marquee > 0 || 
+        deprecatedTags.tableLayout > 0;
+
+      // ========================================================================
+      // STRICT AUDITOR: Font Size Accessibility Check
+      // ========================================================================
+      
+      let bodyFontSize = 16; // Default
+      let minFontSize = 16;
+      
+      try {
+        const bodyElement = document.body;
+        if (bodyElement) {
+          const computed = window.getComputedStyle(bodyElement);
+          const fontSize = parseFloat(computed.fontSize);
+          if (!isNaN(fontSize)) {
+            bodyFontSize = fontSize;
+          }
+        }
+
+        // Check paragraph font sizes
+        const paragraphs = Array.from(document.querySelectorAll('p, li, span, div'));
+        const fontSizes = paragraphs.slice(0, 20).map(el => {
+          const style = window.getComputedStyle(el);
+          return parseFloat(style.fontSize);
+        }).filter(size => !isNaN(size) && size > 0);
+
+        if (fontSizes.length > 0) {
+          minFontSize = Math.min(...fontSizes);
+        }
+      } catch (err) {
+        // Ignore font size detection errors
+      }
+
+      const hasTinyFonts = minFontSize < 14;
+
+      // ========================================================================
       // Legal compliance: Check for Impressum link
+      // ========================================================================
+      
       const anchors = Array.from(document.querySelectorAll('a'));
       const impressumLink = anchors.find((a) => 
         (a.textContent || '').toLowerCase().includes('impressum')
@@ -387,6 +496,13 @@ app.post('/scan', async (req, res) => {
         
         // Tech
         techStack: Array.from(techStack),
+
+        // STRICT AUDITOR: Quality Issues
+        deprecatedTags,
+        hasDeprecatedHTML,
+        bodyFontSize,
+        minFontSize,
+        hasTinyFonts,
       };
     });
 
@@ -395,14 +511,27 @@ app.post('/scan', async (req, res) => {
       h1Count: pageData.h1Count,
       hasImpressum: pageData.hasImpressumLink,
       techStack: pageData.techStack,
+      hasDeprecatedHTML: pageData.hasDeprecatedHTML,
+      consoleErrors: qualityFindings.consoleErrors.length,
+      brokenResources: qualityFindings.brokenResources.length,
     });
 
     // ========================================================================
-    // STEP 5: Issue Detection & Scoring
+    // STRICT AUDITOR: Mixed Content Detection (now that we have finalProtocol)
+    // ========================================================================
+    
+    if (finalProtocol === 'https:' && httpRequests.length > 0) {
+      qualityFindings.mixedContent = httpRequests;
+      console.log(`[StrictAuditor] ⚠️  Mixed content detected: ${httpRequests.length} HTTP resources on HTTPS page`);
+    }
+
+    // ========================================================================
+    // STEP 5: Issue Detection & Scoring (STRICT MODE)
     // ========================================================================
     
     const issues = [];
     let score = 100; // Start with perfect score
+    let hasOldSchoolHTML = false; // Track if we need to cap score at 50
     
     const applyPenalty = (amount, reason) => {
       const oldScore = score;
@@ -422,6 +551,104 @@ app.post('/scan', async (req, res) => {
         )
       );
       applyPenalty(40, 'Missing HTTPS');
+    }
+
+    // ========================================================================
+    // STRICT AUDITOR CHECKS - The "Mean" Detector
+    // ========================================================================
+
+    // --- 1. OLD SCHOOL HTML ARCHAEOLOGY (CRITICAL) ---
+    
+    if (pageData.hasDeprecatedHTML) {
+      hasOldSchoolHTML = true; // Cap score at 50
+      
+      const deprecatedDetails = [];
+      if (pageData.deprecatedTags.font > 0) deprecatedDetails.push(`<font> Tags (${pageData.deprecatedTags.font})`);
+      if (pageData.deprecatedTags.center > 0) deprecatedDetails.push(`<center> Tags (${pageData.deprecatedTags.center})`);
+      if (pageData.deprecatedTags.marquee > 0) deprecatedDetails.push(`<marquee> Tags (${pageData.deprecatedTags.marquee})`);
+      if (pageData.deprecatedTags.frameset > 0) deprecatedDetails.push(`<frameset> Tags (${pageData.deprecatedTags.frameset})`);
+      if (pageData.deprecatedTags.tableLayout > 0) deprecatedDetails.push(`Tabellen-Layout (${pageData.deprecatedTags.tableLayout})`);
+      
+      issues.push(
+        buildIssue(
+          'tech',
+          'critical',
+          'Veraltete Technik (HTML4/Tabellen-Layout)',
+          `Diese Seite ist technisch auf dem Stand von vor 10 Jahren. Gefunden: ${deprecatedDetails.join(', ')}. Diese Technik wird seit 2010 nicht mehr empfohlen.`
+        )
+      );
+      applyPenalty(30, 'Deprecated HTML tags');
+    }
+
+    // --- 2. CONSOLE ERRORS (JavaScript Defects) ---
+    
+    if (qualityFindings.consoleErrors.length > 0 || qualityFindings.pageErrors.length > 0) {
+      const totalErrors = qualityFindings.consoleErrors.length + qualityFindings.pageErrors.length;
+      const errorSamples = [
+        ...qualityFindings.pageErrors.slice(0, 2),
+        ...qualityFindings.consoleErrors.slice(0, 2)
+      ].map(err => err.substring(0, 100)).join('; ');
+      
+      issues.push(
+        buildIssue(
+          'tech',
+          'high',
+          'JavaScript-Fehler erkannt',
+          `${totalErrors} JavaScript-Fehler während des Ladens erkannt. Funktionen der Seite könnten defekt sein. Beispiele: ${errorSamples || 'Siehe Browser-Konsole'}`
+        )
+      );
+      applyPenalty(15, 'JavaScript errors');
+    }
+
+    // --- 3. TINY FONTS (Readability/Accessibility) ---
+    
+    if (pageData.hasTinyFonts) {
+      issues.push(
+        buildIssue(
+          'accessibility',
+          'medium',
+          'Schriftgröße zu klein',
+          `Schriftgröße ist zu klein (${Math.round(pageData.minFontSize)}px gefunden). Empfohlen sind mindestens 14-16px für gute Lesbarkeit auf Mobilgeräten.`
+        )
+      );
+      applyPenalty(10, 'Font size too small');
+    }
+
+    // --- 4. BROKEN RESOURCES (404 Errors) ---
+    
+    if (qualityFindings.brokenResources.length > 0) {
+      const brokenCount = qualityFindings.brokenResources.length;
+      const brokenTypes = [...new Set(qualityFindings.brokenResources.map(r => r.type))].join(', ');
+      const examples = qualityFindings.brokenResources.slice(0, 2)
+        .map(r => r.url.split('/').pop())
+        .join(', ');
+      
+      issues.push(
+        buildIssue(
+          'tech',
+          'high',
+          'Defekte Bilder oder Dateien',
+          `${brokenCount} Ressourcen konnten nicht geladen werden (404 Fehler). Typen: ${brokenTypes}. Beispiele: ${examples}`
+        )
+      );
+      applyPenalty(10, 'Broken resources (404)');
+    }
+
+    // --- 5. MIXED CONTENT (Security Risk on HTTPS) ---
+    
+    if (qualityFindings.mixedContent.length > 0) {
+      const mixedCount = qualityFindings.mixedContent.length;
+      const mixedTypes = [...new Set(qualityFindings.mixedContent.map(r => r.type))].join(', ');
+      
+      issues.push(
+        buildIssue(
+          'security',
+          'high',
+          'Unsichere Inhalte (Mixed Content)',
+          `${mixedCount} Ressourcen werden über unsicheres HTTP geladen, obwohl die Seite HTTPS nutzt. Das grüne Schloss im Browser verschwindet. Typen: ${mixedTypes}`
+        )
+      );
+      applyPenalty(20, 'Mixed content (HTTP on HTTPS)');
     }
 
     // --- MOBILE CHECKS ---
@@ -669,6 +896,29 @@ app.post('/scan', async (req, res) => {
     if (pageData.canonicalLink) {
       console.log('[EliteScanner] ✅ Canonical link present');
     }
+
+    // ========================================================================
+    // STRICT AUDITOR: Final Score Adjustment
+    // ========================================================================
+    
+    // If old school HTML detected, MAX score is 50 (website is fundamentally outdated)
+    if (hasOldSchoolHTML && score > 50) {
+      const scoreBefore = score;
+      score = 50;
+      console.log(`[StrictAuditor] ⚠️  Score capped at 50 due to deprecated HTML (was ${scoreBefore})`);
+      
+      // Add additional warning
+      issues.push(
+        buildIssue(
+          'tech',
+          'critical',
+          'Score auf 50 begrenzt',
+          'Aufgrund der veralteten HTML-Technik wurde der Score auf maximal 50 Punkte begrenzt. Eine technische Überarbeitung ist dringend empfohlen.'
+        )
+      );
+    }
+
+    console.log(`[EliteScanner] 📊 Final Score: ${score}/100 | Issues: ${issues.length}`);
 
     // ========================================================================
     // STEP 6: Screenshot Capture
