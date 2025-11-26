@@ -11,14 +11,15 @@ const { chromium } = require('playwright');
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// Hard cap for each scan in milliseconds (30 seconds)
-const DEFAULT_TIMEOUT_MS = 30_000;
+// Timeouts
+const SCAN_TIMEOUT_MS = 30_000;   // 30 seconds for /scan
+const HARVEST_TIMEOUT_MS = 45_000; // 45 seconds for /harvest (multi-page)
 
-// Desktop Chrome user agent so we look like a normal browser
+// Desktop Chrome user agent
 const USER_AGENT =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-// Safe headless flags for common hosting environments
+// Safe headless flags
 const HEADLESS_ARGS = [
   '--no-sandbox',
   '--disable-setuid-sandbox',
@@ -41,8 +42,6 @@ app.use(express.json());
 
 /**
  * Normalize and validate user URL input.
- * - Adds https:// if missing.
- * - Ensures only http/https protocols.
  */
 function normalizeUrl(rawUrl = '') {
   const trimmed = String(rawUrl || '').trim();
@@ -95,23 +94,63 @@ async function withTimeout(promise, timeoutMs, timeoutMessage) {
   }
 }
 
+/**
+ * Resolve relative URL to absolute URL
+ */
+function resolveUrl(baseUrl, relativeUrl) {
+  try {
+    return new URL(relativeUrl, baseUrl).href;
+  } catch {
+    return relativeUrl; // Return as-is if can't resolve
+  }
+}
+
+/**
+ * Extract emails from text using regex
+ */
+function extractEmails(text) {
+  const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
+  const matches = text.match(emailRegex) || [];
+  return [...new Set(matches)];
+}
+
+/**
+ * Extract phone numbers from text
+ */
+function extractPhones(text) {
+  const phoneRegex = /(\+?\d{1,4}[\s\-\.]?)?\(?\d{2,4}\)?[\s\-\.]?\d{3,4}[\s\-\.]?\d{3,4}/g;
+  const matches = text.match(phoneRegex) || [];
+  // Filter out false positives
+  return [...new Set(matches.filter(p => p.replace(/\D/g, '').length >= 8))];
+}
+
+/**
+ * Check if URL is internal (same domain)
+ */
+function isInternalUrl(baseUrl, testUrl) {
+  try {
+    const base = new URL(baseUrl);
+    const test = new URL(testUrl, baseUrl);
+    return base.hostname === test.hostname;
+  } catch {
+    return false;
+  }
+}
+
 // ---------------------------------------------------------------------------
-// Core scan logic
+// Core scan logic (existing /scan endpoint)
 // ---------------------------------------------------------------------------
 
 /**
  * Perform the elite scan for a single URL.
- * Returns the JSON object described in the requirements.
  */
 async function performScan(inputUrl) {
   let browser;
 
   try {
     const targetUrl = normalizeUrl(inputUrl);
-
     console.log(`[EliteScanner] Starting scan for ${targetUrl.href}`);
 
-    // 1) Setup browser and context
     browser = await chromium.launch({
       headless: true,
       args: HEADLESS_ARGS,
@@ -122,7 +161,7 @@ async function performScan(inputUrl) {
       userAgent: USER_AGENT,
     });
 
-    // 2) GDPR: track external fonts / maps via request interception
+    // GDPR tracking
     const gdprFindings = {
       googleFonts: false,
       googleMaps: false,
@@ -132,12 +171,10 @@ async function performScan(inputUrl) {
       try {
         const reqUrl = route.request().url();
 
-        // Google Fonts
         if (/fonts\.googleapis\.com/i.test(reqUrl) || /fonts\.gstatic\.com/i.test(reqUrl)) {
           gdprFindings.googleFonts = true;
         }
 
-        // Google Maps
         if (/maps\.googleapis\.com/i.test(reqUrl) || /maps\.gstatic\.com/i.test(reqUrl)) {
           gdprFindings.googleMaps = true;
         }
@@ -154,17 +191,14 @@ async function performScan(inputUrl) {
     });
 
     const page = await context.newPage();
-    page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
+    page.setDefaultTimeout(SCAN_TIMEOUT_MS);
 
-    // 3) Navigate (HTTP vs HTTPS handled by final URL)
     try {
       await page.goto(targetUrl.href, {
         waitUntil: 'domcontentloaded',
-        timeout: DEFAULT_TIMEOUT_MS,
+        timeout: SCAN_TIMEOUT_MS,
       });
-      await page.waitForLoadState('networkidle', { timeout: DEFAULT_TIMEOUT_MS }).catch(() => {
-        // networkidle might never fire – that's OK
-      });
+      await page.waitForLoadState('networkidle', { timeout: SCAN_TIMEOUT_MS }).catch(() => {});
     } catch {
       throw new Error('Target site unreachable or timed out.');
     }
@@ -178,7 +212,6 @@ async function performScan(inputUrl) {
       }
     })();
 
-    // 4) Extract DOM-based info
     const pageData = await page.evaluate(() => {
       const html = document.documentElement?.innerHTML || '';
       const lowerHtml = html.toLowerCase();
@@ -190,18 +223,14 @@ async function performScan(inputUrl) {
 
       const techStackSet = new Set();
 
-      // tech (Generator / CMS / builder)
       if (lowerHtml.includes('wp-content')) techStackSet.add('WordPress');
       if (lowerHtml.includes('wixstatic.com') || lowerHtml.includes('wixsite.com'))
         techStackSet.add('Wix');
       if (lowerHtml.includes('jimstatic.com') || lowerHtml.includes('jimdo'))
         techStackSet.add('Jimdo');
-
-      // Extra tech signals
       if (lowerHtml.includes('squarespace')) techStackSet.add('Squarespace');
       if (lowerHtml.includes('shopify')) techStackSet.add('Shopify');
 
-      // Google Analytics / Tag Manager
       if (
         lowerHtml.includes('google-analytics.com') ||
         lowerHtml.includes('gtag(') ||
@@ -227,7 +256,6 @@ async function performScan(inputUrl) {
       };
     });
 
-    // 5) Scoring & issues
     let score = 100;
     const issues = [];
 
@@ -235,7 +263,6 @@ async function performScan(inputUrl) {
       score = Math.max(0, score - amount);
     };
 
-    // security (SSL)
     if (finalProtocol !== 'https:') {
       issues.push(
         buildIssue('security', 'high', 'Webseite ist nicht verschlüsselt (kein HTTPS).')
@@ -243,7 +270,6 @@ async function performScan(inputUrl) {
       applyPenalty(40);
     }
 
-    // mobile (Viewport)
     if (!pageData.hasViewportMeta) {
       issues.push(
         buildIssue('mobile', 'high', 'Kein responsiver Viewport-Meta-Tag gefunden.')
@@ -251,7 +277,6 @@ async function performScan(inputUrl) {
       applyPenalty(20);
     }
 
-    // legal (Impressum)
     if (!pageData.hasImpressumLink) {
       issues.push(
         buildIssue('legal', 'critical', 'Kein Impressum-Link gefunden.')
@@ -259,7 +284,6 @@ async function performScan(inputUrl) {
       applyPenalty(30);
     }
 
-    // gdpr (Google Fonts)
     if (gdprFindings.googleFonts) {
       issues.push(
         buildIssue(
@@ -271,14 +295,12 @@ async function performScan(inputUrl) {
       applyPenalty(20);
     }
 
-    // gdpr (Google Maps) – informational for now
     if (gdprFindings.googleMaps) {
       issues.push(
         buildIssue('gdpr', 'medium', 'Google Maps wird extern eingebunden.')
       );
     }
 
-    // seo (Title)
     if (!pageData.title || pageData.title.length < 10) {
       const lengthInfo = pageData.title ? ` (${pageData.title.length} Zeichen)` : '';
       issues.push(
@@ -287,7 +309,6 @@ async function performScan(inputUrl) {
       applyPenalty(5);
     }
 
-    // seo (Description)
     if (!pageData.metaDescription) {
       issues.push(
         buildIssue('seo', 'medium', 'Meta-Description fehlt.')
@@ -295,7 +316,6 @@ async function performScan(inputUrl) {
       applyPenalty(5);
     }
 
-    // seo (Headings / H1 count)
     if (pageData.h1Count === 0 || pageData.h1Count > 1) {
       issues.push(
         buildIssue('seo', 'medium', `H1-Struktur fehlerhaft (gefunden: ${pageData.h1Count}).`)
@@ -303,7 +323,6 @@ async function performScan(inputUrl) {
       applyPenalty(5);
     }
 
-    // 6) Optional screenshot of top page (base64)
     let screenshotBase64 = null;
     try {
       const screenshotBuffer = await page.screenshot({
@@ -337,15 +356,224 @@ async function performScan(inputUrl) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Deep Crawler - The Vacuum (NEW)
+// ---------------------------------------------------------------------------
+
 /**
- * Content harvester - extracts all content for website relaunch
+ * Extract content from a single page
  */
-async function harvestContent(inputUrl) {
+async function extractPageContent(page, baseUrl) {
+  return await page.evaluate((base) => {
+    // Helper functions inside browser context
+    function extractEmails(text) {
+      const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
+      const matches = text.match(emailRegex) || [];
+      return [...new Set(matches)];
+    }
+
+    function extractPhones(text) {
+      const phoneRegex = /(\+?\d{1,4}[\s\-\.]?)?\(?\d{2,4}\)?[\s\-\.]?\d{3,4}[\s\-\.]?\d{3,4}/g;
+      const matches = text.match(phoneRegex) || [];
+      return [...new Set(matches.filter(p => p.replace(/\D/g, '').length >= 8))];
+    }
+
+    function resolveUrl(relativeUrl) {
+      try {
+        return new URL(relativeUrl, base).href;
+      } catch {
+        return relativeUrl;
+      }
+    }
+
+    // Get page title
+    const title = (document.title || '').trim();
+
+    // Get all text content
+    const bodyText = document.body?.innerText || '';
+
+    // Extract headings
+    const headings = [];
+    ['h1', 'h2', 'h3'].forEach(tag => {
+      Array.from(document.querySelectorAll(tag)).forEach(el => {
+        const text = el.innerText?.trim();
+        if (text && text.length > 0) {
+          headings.push(text);
+        }
+      });
+    });
+
+    // Extract main content (try to avoid nav/footer)
+    let content = bodyText;
+    try {
+      const mainContent = 
+        document.querySelector('main') ||
+        document.querySelector('article') ||
+        document.querySelector('[role="main"]') ||
+        document.querySelector('.content') ||
+        document.querySelector('#content') ||
+        document.querySelector('.main-content');
+      
+      if (mainContent) {
+        content = mainContent.innerText || bodyText;
+      }
+    } catch {
+      // Fallback to body text
+    }
+
+    // Clean content: remove excessive whitespace
+    content = content.replace(/\s+/g, ' ').trim();
+
+    // Extract images with FULL URL resolution
+    const images = [];
+    Array.from(document.querySelectorAll('img')).forEach(img => {
+      const src = img.src || img.getAttribute('src');
+      if (!src) return;
+
+      // Resolve relative URLs
+      const absoluteSrc = resolveUrl(src);
+      
+      const width = img.naturalWidth || img.width || 0;
+      const height = img.naturalHeight || img.height || 0;
+
+      // Filter out tiny icons (< 50px)
+      if (width >= 50 && height >= 50) {
+        images.push({
+          url: absoluteSrc,
+          alt: img.alt || '',
+          width,
+          height,
+        });
+      }
+    });
+
+    // Extract contact info
+    const emails = extractEmails(bodyText);
+    const phones = extractPhones(bodyText);
+
+    // Also check mailto and tel links
+    Array.from(document.querySelectorAll('a[href^="mailto:"]')).forEach(a => {
+      const email = (a.getAttribute('href') || '').replace('mailto:', '').split('?')[0];
+      if (email) emails.push(email);
+    });
+
+    Array.from(document.querySelectorAll('a[href^="tel:"]')).forEach(a => {
+      const phone = (a.getAttribute('href') || '').replace('tel:', '').trim();
+      if (phone) phones.push(phone);
+    });
+
+    return {
+      url: window.location.href,
+      title,
+      headings,
+      content: content.substring(0, 3000), // First 3000 chars
+      images: images.slice(0, 20), // Max 20 images per page
+      emails: [...new Set(emails)],
+      phones: [...new Set(phones)],
+    };
+  }, baseUrl);
+}
+
+/**
+ * Discover internal links from a page
+ */
+async function discoverLinks(page, baseUrl) {
+  return await page.evaluate((base) => {
+    function isInternalUrl(testUrl) {
+      try {
+        const baseObj = new URL(base);
+        const testObj = new URL(testUrl, base);
+        return baseObj.hostname === testObj.hostname;
+      } catch {
+        return false;
+      }
+    }
+
+    const links = new Set();
+    const anchors = Array.from(document.querySelectorAll('a'));
+    
+    anchors.forEach(a => {
+      const href = a.getAttribute('href');
+      if (!href) return;
+
+      // Skip common non-content links
+      if (href.startsWith('#') || href.startsWith('javascript:') || href.startsWith('mailto:') || href.startsWith('tel:')) {
+        return;
+      }
+
+      try {
+        const absoluteUrl = new URL(href, base).href;
+        
+        // Only include internal links
+        if (isInternalUrl(absoluteUrl)) {
+          // Remove hash and trailing slash for deduplication
+          const cleanUrl = absoluteUrl.split('#')[0].replace(/\/$/, '');
+          
+          // Skip PDFs, images, downloads
+          if (!/\.(pdf|jpg|jpeg|png|gif|zip|rar|doc|docx)$/i.test(cleanUrl)) {
+            links.add(cleanUrl);
+          }
+        }
+      } catch {
+        // Skip invalid URLs
+      }
+    });
+
+    return Array.from(links);
+  }, baseUrl);
+}
+
+/**
+ * Extract social media links
+ */
+async function extractSocials(page) {
+  return await page.evaluate(() => {
+    const socials = [];
+    const links = Array.from(document.querySelectorAll('a'));
+    
+    links.forEach(a => {
+      const href = (a.href || '').toLowerCase();
+      
+      if (href.includes('facebook.com/') && !href.includes('/sharer')) {
+        socials.push({ platform: 'Facebook', url: a.href });
+      } else if (href.includes('instagram.com/')) {
+        socials.push({ platform: 'Instagram', url: a.href });
+      } else if (href.includes('linkedin.com/')) {
+        socials.push({ platform: 'LinkedIn', url: a.href });
+      } else if (href.includes('twitter.com/') || href.includes('x.com/')) {
+        socials.push({ platform: 'Twitter', url: a.href });
+      } else if (href.includes('youtube.com/') || href.includes('youtu.be/')) {
+        socials.push({ platform: 'YouTube', url: a.href });
+      } else if (href.includes('xing.com/')) {
+        socials.push({ platform: 'XING', url: a.href });
+      }
+    });
+
+    // Deduplicate
+    const seen = new Set();
+    return socials.filter(s => {
+      if (seen.has(s.url)) return false;
+      seen.add(s.url);
+      return true;
+    });
+  });
+}
+
+/**
+ * The Deep Crawler - visits multiple pages and extracts everything
+ */
+async function deepCrawl(inputUrl) {
   let browser;
+  const startTime = Date.now();
+  const MAX_PAGES = 10;
+  const CONCURRENT_TABS = 3;
 
   try {
     const targetUrl = normalizeUrl(inputUrl);
-    console.log(`[ContentHarvester] Starting harvest for ${targetUrl.href}`);
+    const baseUrl = targetUrl.href;
+    const domain = targetUrl.hostname;
+
+    console.log(`[DeepCrawler] Starting deep crawl for ${domain}`);
 
     browser = await chromium.launch({
       headless: true,
@@ -357,179 +585,126 @@ async function harvestContent(inputUrl) {
       userAgent: USER_AGENT,
     });
 
-    const page = await context.newPage();
-    page.setDefaultTimeout(DEFAULT_TIMEOUT_MS);
+    // Step 1: Visit homepage
+    console.log(`[DeepCrawler] Visiting homepage: ${baseUrl}`);
+    const homePage = await context.newPage();
+    homePage.setDefaultTimeout(10000);
 
-    // Navigate to the page
     try {
-      await page.goto(targetUrl.href, {
+      await homePage.goto(baseUrl, {
         waitUntil: 'domcontentloaded',
-        timeout: DEFAULT_TIMEOUT_MS,
+        timeout: 10000,
       });
-      await page.waitForLoadState('networkidle', { timeout: DEFAULT_TIMEOUT_MS }).catch(() => {
-        // networkidle might never fire – that's OK
-      });
-    } catch {
+      await homePage.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+    } catch (navError) {
+      console.error(`[DeepCrawler] Failed to load homepage: ${navError.message}`);
       throw new Error('Target site unreachable or timed out.');
     }
 
-    // Extract all content in browser context
-    const extractedData = await page.evaluate(() => {
-      // Helper: Extract emails from text
-      function extractEmails(text) {
-        const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
-        const matches = text.match(emailRegex) || [];
-        return [...new Set(matches)]; // Remove duplicates
+    // Extract homepage content
+    const homeContent = await extractPageContent(homePage, baseUrl);
+    
+    // Discover links
+    const discoveredLinks = await discoverLinks(homePage, baseUrl);
+    console.log(`[DeepCrawler] Discovered ${discoveredLinks.length} internal links`);
+
+    // Extract socials
+    const socials = await extractSocials(homePage);
+
+    // Close homepage
+    await homePage.close();
+
+    // Step 2: Filter and limit links
+    const uniqueLinks = [...new Set(discoveredLinks)]
+      .filter(link => link !== baseUrl && link !== baseUrl + '/') // Exclude homepage
+      .slice(0, MAX_PAGES); // Limit to 10 pages
+
+    console.log(`[DeepCrawler] Will visit ${uniqueLinks.length} subpages`);
+
+    // Step 3: Visit subpages with concurrency control
+    const subpageContents = [];
+    
+    for (let i = 0; i < uniqueLinks.length; i += CONCURRENT_TABS) {
+      const batch = uniqueLinks.slice(i, i + CONCURRENT_TABS);
+      
+      // Check if we're running out of time
+      const elapsed = Date.now() - startTime;
+      if (elapsed > HARVEST_TIMEOUT_MS - 10000) {
+        console.log(`[DeepCrawler] Approaching timeout, stopping at ${i} pages`);
+        break;
       }
 
-      // Helper: Extract phone numbers (German and international formats)
-      function extractPhones(text) {
-        const phoneRegex = /(\+?\d{1,4}[\s-]?)?\(?\d{2,4}\)?[\s-]?\d{3,4}[\s-]?\d{3,4}/g;
-        const matches = text.match(phoneRegex) || [];
-        // Filter out obvious false positives (like years)
-        return [...new Set(matches.filter(p => p.replace(/\D/g, '').length >= 8))];
-      }
+      // Visit batch in parallel
+      const batchPromises = batch.map(async (link) => {
+        const page = await context.newPage();
+        page.setDefaultTimeout(8000);
 
-      // Meta information
-      const title = (document.title || '').trim();
-      const metaDescription =
-        document.querySelector('meta[name="description"]')?.getAttribute('content')?.trim() || '';
+        try {
+          console.log(`[DeepCrawler] Visiting: ${link}`);
+          await page.goto(link, {
+            waitUntil: 'domcontentloaded',
+            timeout: 8000,
+          });
+          await page.waitForLoadState('networkidle', { timeout: 5000 }).catch(() => {});
 
-      // Get all text content for email/phone extraction
-      const bodyText = document.body?.innerText || '';
-      
-      // Also check mailto links for emails
-      const mailtoLinks = Array.from(document.querySelectorAll('a[href^="mailto:"]'));
-      const mailtoEmails = mailtoLinks.map(a => {
-        const href = a.getAttribute('href') || '';
-        return href.replace('mailto:', '').split('?')[0];
-      }).filter(Boolean);
-
-      // Also check tel links for phones
-      const telLinks = Array.from(document.querySelectorAll('a[href^="tel:"]'));
-      const telPhones = telLinks.map(a => {
-        const href = a.getAttribute('href') || '';
-        return href.replace('tel:', '').trim();
-      }).filter(Boolean);
-
-      // Combine extracted contact info
-      const emails = [...new Set([...extractEmails(bodyText), ...mailtoEmails])];
-      const phones = [...new Set([...extractPhones(bodyText), ...telPhones])];
-
-      // Extract headings
-      const h1Texts = Array.from(document.querySelectorAll('h1'))
-        .map(h => h.innerText?.trim())
-        .filter(Boolean);
-      const h2Texts = Array.from(document.querySelectorAll('h2'))
-        .map(h => h.innerText?.trim())
-        .filter(Boolean);
-      const h3Texts = Array.from(document.querySelectorAll('h3'))
-        .map(h => h.innerText?.trim())
-        .filter(Boolean);
-
-      const headlines = [...h1Texts, ...h2Texts, ...h3Texts];
-
-      // Extract images (filter small icons, get dimensions)
-      const images = Array.from(document.querySelectorAll('img'))
-        .map(img => {
-          const src = img.src;
-          const width = img.naturalWidth || img.width || 0;
-          const height = img.naturalHeight || img.height || 0;
-          const alt = img.alt || '';
-          
-          return { src, width, height, alt, area: width * height };
-        })
-        .filter(img => {
-          // Filter out small icons (< 200px in either dimension)
-          return img.width >= 200 && img.height >= 200;
-        })
-        .sort((a, b) => b.area - a.area) // Sort by area (largest first)
-        .slice(0, 5) // Take top 5
-        .map(img => img.src);
-
-      // Extract social media links
-      const links = Array.from(document.querySelectorAll('a'));
-      const socials = [];
-      
-      links.forEach(a => {
-        const href = a.href?.toLowerCase() || '';
-        if (href.includes('facebook.com/') && !href.includes('/sharer')) {
-          socials.push({ platform: 'Facebook', url: a.href });
-        } else if (href.includes('instagram.com/')) {
-          socials.push({ platform: 'Instagram', url: a.href });
-        } else if (href.includes('linkedin.com/')) {
-          socials.push({ platform: 'LinkedIn', url: a.href });
-        } else if (href.includes('twitter.com/') || href.includes('x.com/')) {
-          socials.push({ platform: 'Twitter', url: a.href });
-        } else if (href.includes('youtube.com/') || href.includes('youtu.be/')) {
-          socials.push({ platform: 'YouTube', url: a.href });
-        } else if (href.includes('xing.com/')) {
-          socials.push({ platform: 'XING', url: a.href });
+          const content = await extractPageContent(page, baseUrl);
+          return content;
+        } catch (error) {
+          console.warn(`[DeepCrawler] Failed to load ${link}: ${error.message}`);
+          return null;
+        } finally {
+          await page.close().catch(() => {});
         }
       });
 
-      // Remove duplicate socials
-      const uniqueSocials = [];
-      const seenUrls = new Set();
-      socials.forEach(social => {
-        if (!seenUrls.has(social.url)) {
-          seenUrls.add(social.url);
-          uniqueSocials.push(social);
-        }
-      });
+      const batchResults = await Promise.all(batchPromises);
+      subpageContents.push(...batchResults.filter(Boolean));
+    }
 
-      // Get main body text (cleaned)
-      let rawText = bodyText;
-      
-      // Try to remove header/footer/nav text for cleaner content
-      try {
-        const mainContent = 
-          document.querySelector('main') ||
-          document.querySelector('article') ||
-          document.querySelector('[role="main"]') ||
-          document.querySelector('.content') ||
-          document.querySelector('#content') ||
-          document.body;
-        
-        if (mainContent) {
-          rawText = mainContent.innerText || bodyText;
-        }
-      } catch {
-        // Fallback to body text
-      }
+    // Step 4: Aggregate all data
+    const allPages = [homeContent, ...subpageContents];
 
-      // Trim to first 2000 chars
-      const trimmedText = rawText.substring(0, 2000);
+    // Collect all global contact info
+    const globalEmails = new Set();
+    const globalPhones = new Set();
 
-      return {
-        meta: {
-          title,
-          description: metaDescription,
-        },
-        contact: {
-          emails,
-          phones,
-        },
-        socials: uniqueSocials,
-        headlines,
-        images,
-        rawText: trimmedText,
-      };
+    allPages.forEach(page => {
+      page.emails.forEach(e => globalEmails.add(e));
+      page.phones.forEach(p => globalPhones.add(p));
     });
 
-    console.log(`[ContentHarvester] Extracted: ${extractedData.headlines.length} headlines, ${extractedData.images.length} images, ${extractedData.contact.emails.length} emails`);
-
-    return {
-      status: 'success',
-      ...extractedData,
+    // Build final response
+    const result = {
+      domain,
+      global: {
+        emails: Array.from(globalEmails),
+        phones: Array.from(globalPhones),
+        socials,
+      },
+      pages: allPages.map(page => ({
+        url: page.url,
+        title: page.title,
+        headings: page.headings,
+        content: page.content,
+        images: page.images.map(img => img.url), // Just return URLs
+      })),
+      metadata: {
+        pagesVisited: allPages.length,
+        totalImages: allPages.reduce((sum, p) => sum + p.images.length, 0),
+        crawlDuration: `${Date.now() - startTime}ms`,
+      },
     };
+
+    console.log(`[DeepCrawler] Crawl complete: ${result.pages.length} pages, ${result.global.emails.length} emails, ${result.metadata.totalImages} images`);
+
+    return result;
 
   } finally {
     if (browser) {
       try {
         await browser.close();
       } catch (closeError) {
-        console.error('[ContentHarvester] Browser close error:', closeError);
+        console.error('[DeepCrawler] Browser close error:', closeError);
       }
     }
   }
@@ -549,7 +724,7 @@ app.post('/scan', async (req, res) => {
 
     const result = await withTimeout(
       performScan(url),
-      DEFAULT_TIMEOUT_MS,
+      SCAN_TIMEOUT_MS,
       'Scan timeout after 30 seconds.'
     );
 
@@ -578,14 +753,14 @@ app.post('/harvest', async (req, res) => {
     const url = req.body && req.body.url;
 
     const result = await withTimeout(
-      harvestContent(url),
-      DEFAULT_TIMEOUT_MS,
-      'Harvest timeout after 30 seconds.'
+      deepCrawl(url),
+      HARVEST_TIMEOUT_MS,
+      'Harvest timeout after 45 seconds.'
     );
 
     res.json(result);
   } catch (error) {
-    console.error('[ContentHarvester] Harvest failed:', error);
+    console.error('[DeepCrawler] Harvest failed:', error);
 
     const message = error && error.message ? error.message : 'Harvest failed';
     const isUserError =
@@ -608,15 +783,16 @@ app.post('/harvest', async (req, res) => {
 // ---------------------------------------------------------------------------
 
 app.listen(PORT, () => {
-  console.log(`[EliteScanner] Server listening on port ${PORT}`);
+  console.log(`[SiteSweep] Server listening on port ${PORT}`);
+  console.log(`[SiteSweep] Endpoints: /health, /scan, /harvest`);
 });
 
 process.on('SIGTERM', () => {
-  console.log('[EliteScanner] SIGTERM received, shutting down.');
+  console.log('[SiteSweep] SIGTERM received, shutting down.');
   process.exit(0);
 });
 
 process.on('SIGINT', () => {
-  console.log('[EliteScanner] SIGINT received, shutting down.');
+  console.log('[SiteSweep] SIGINT received, shutting down.');
   process.exit(0);
 });
