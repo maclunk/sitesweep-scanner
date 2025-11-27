@@ -216,11 +216,16 @@ async function performScan(inputUrl) {
       const html = document.documentElement?.innerHTML || '';
       const lowerHtml = html.toLowerCase();
       
+      // Legal compliance checks
       const anchors = Array.from(document.querySelectorAll('a'));
       const hasImpressumLink = anchors.some((a) =>
         (a.textContent || '').toLowerCase().includes('impressum')
       );
+      const hasDatenschutzLink = anchors.some((a) =>
+        (a.textContent || '').toLowerCase().includes('datenschutz')
+      );
 
+      // Tech stack detection
       const techStackSet = new Set();
 
       if (lowerHtml.includes('wp-content')) techStackSet.add('WordPress');
@@ -240,18 +245,37 @@ async function performScan(inputUrl) {
         techStackSet.add('Google Analytics');
       }
 
+      // SEO meta data
       const title = (document.title || '').trim();
       const metaDescription =
         document.querySelector('meta[name="description"]')?.getAttribute('content')?.trim() || '';
       const hasViewportMeta = Boolean(document.querySelector('meta[name="viewport"]'));
       const h1Count = document.querySelectorAll('h1').length;
 
+      // Language tag
+      const htmlLang = document.documentElement.lang || '';
+
+      // Open Graph
+      const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute('content') || '';
+      const ogDescription = document.querySelector('meta[property="og:description"]')?.getAttribute('content') || '';
+
+      // Image accessibility
+      const images = Array.from(document.querySelectorAll('img'));
+      const totalImages = images.length;
+      const imagesWithoutAlt = images.filter(img => !img.alt || img.alt.trim() === '').length;
+
       return {
         title,
         metaDescription,
         hasViewportMeta,
         hasImpressumLink,
+        hasDatenschutzLink,
         h1Count,
+        htmlLang,
+        ogTitle,
+        ogDescription,
+        totalImages,
+        imagesWithoutAlt,
         techStack: Array.from(techStackSet),
       };
     });
@@ -277,19 +301,30 @@ async function performScan(inputUrl) {
       applyPenalty(20);
     }
     
+    // --- LEGAL COMPLIANCE (Critical for German/EU) ---
+    
     if (!pageData.hasImpressumLink) {
       issues.push(
-        buildIssue('legal', 'critical', 'Kein Impressum-Link gefunden.')
+        buildIssue('legal', 'critical', 'Kein Impressum-Link gefunden. Dies ist in Deutschland gesetzlich vorgeschrieben (§5 TMG)!')
       );
       applyPenalty(30);
     }
+
+    if (!pageData.hasDatenschutzLink) {
+      issues.push(
+        buildIssue('legal', 'high', 'Kein Datenschutz-Link gefunden. DSGVO-Verstoß!')
+      );
+      applyPenalty(15);
+    }
+
+    // --- GDPR VIOLATIONS ---
     
     if (gdprFindings.googleFonts) {
       issues.push(
         buildIssue(
-          'gdpr', 
-          'high', 
-          'Google Fonts werden extern geladen (mögliche DSGVO-Verletzung).'
+          'gdpr',
+          'high',
+          'Google Fonts werden extern geladen. DSGVO-Verstoß nach EuGH-Urteil! Schriftarten sollten lokal gehostet werden.'
         )
       );
       applyPenalty(20);
@@ -297,53 +332,114 @@ async function performScan(inputUrl) {
 
     if (gdprFindings.googleMaps) {
       issues.push(
-        buildIssue('gdpr', 'medium', 'Google Maps wird extern eingebunden.')
+        buildIssue('gdpr', 'medium', 'Google Maps wird ohne Consent-Management eingebunden. Möglicher DSGVO-Verstoß.')
       );
+      applyPenalty(10);
     }
 
-    if (!pageData.title || pageData.title.length < 10) {
-      const lengthInfo = pageData.title ? ` (${pageData.title.length} Zeichen)` : '';
+    // --- SEO CHECKS ---
+    
+    if (!pageData.title) {
       issues.push(
-        buildIssue('seo', 'medium', `Seitentitel fehlt oder ist zu kurz${lengthInfo}.`)
+        buildIssue('seo', 'medium', 'Seitentitel fehlt komplett. Wichtig für Suchmaschinen!')
       );
       applyPenalty(5);
+    } else if (pageData.title.length < 10) {
+      issues.push(
+        buildIssue('seo', 'medium', `Seitentitel ist zu kurz (${pageData.title.length} Zeichen). Empfohlen: 50-60 Zeichen.`)
+      );
+      applyPenalty(5);
+    } else if (pageData.title.length > 70) {
+      issues.push(
+        buildIssue('seo', 'low', `Seitentitel ist zu lang (${pageData.title.length} Zeichen). Google kürzt nach ~60 Zeichen.`)
+      );
+      applyPenalty(3);
     }
 
     if (!pageData.metaDescription) {
       issues.push(
-        buildIssue('seo', 'medium', 'Meta-Description fehlt.')
+        buildIssue('seo', 'medium', 'Meta-Description fehlt. Wichtig für Suchergebnisse!')
+      );
+      applyPenalty(5);
+    } else if (pageData.metaDescription.length < 50) {
+      issues.push(
+        buildIssue('seo', 'low', `Meta-Description ist zu kurz (${pageData.metaDescription.length} Zeichen). Empfohlen: 150-160 Zeichen.`)
+      );
+      applyPenalty(3);
+    }
+
+    if (pageData.h1Count === 0) {
+      issues.push(
+        buildIssue('seo', 'medium', 'Keine H1-Überschrift gefunden. Wichtig für SEO-Struktur!')
+      );
+      applyPenalty(5);
+    } else if (pageData.h1Count > 1) {
+      issues.push(
+        buildIssue('seo', 'medium', `Mehrere H1-Überschriften gefunden (${pageData.h1Count}). Es sollte nur eine H1 pro Seite geben.`)
       );
       applyPenalty(5);
     }
 
-    if (pageData.h1Count === 0 || pageData.h1Count > 1) {
+    if (!pageData.htmlLang) {
       issues.push(
-        buildIssue('seo', 'medium', `H1-Struktur fehlerhaft (gefunden: ${pageData.h1Count}).`)
+        buildIssue('seo', 'low', 'HTML-Sprachattribut fehlt. Sollte gesetzt werden für bessere Barrierefreiheit.')
+      );
+      applyPenalty(2);
+    }
+
+    if (!pageData.ogTitle && !pageData.ogDescription) {
+      issues.push(
+        buildIssue('seo', 'low', 'Open Graph Tags fehlen. Wichtig für Social Media Sharing (Facebook, LinkedIn).')
+      );
+      applyPenalty(3);
+    }
+
+    // --- ACCESSIBILITY ---
+    
+    if (pageData.totalImages > 0 && pageData.imagesWithoutAlt > 0) {
+      const percentage = Math.round((pageData.imagesWithoutAlt / pageData.totalImages) * 100);
+      issues.push(
+        buildIssue(
+          'accessibility',
+          'medium',
+          `${pageData.imagesWithoutAlt} von ${pageData.totalImages} Bildern haben keinen Alt-Text (${percentage}%). Wichtig für Barrierefreiheit!`
+        )
       );
       applyPenalty(5);
     }
     
-    let screenshotBase64 = null;
+    // Screenshot capture with proper format
+    let screenshotDataUrl = null;
     try {
       const screenshotBuffer = await page.screenshot({
         fullPage: false,
         type: 'jpeg',
         quality: 60,
+        timeout: 10000,
       });
-      screenshotBase64 = screenshotBuffer.toString('base64');
+      const base64String = screenshotBuffer.toString('base64');
+      // CRITICAL: Return as data URL for frontend display
+      screenshotDataUrl = `data:image/jpeg;base64,${base64String}`;
+      console.log('[EliteScanner] Screenshot captured successfully');
     } catch (screenshotError) {
       console.warn('[EliteScanner] Screenshot failed:', screenshotError.message);
     }
 
     const techStack = Array.from(new Set(pageData.techStack || []));
 
+    console.log(`[EliteScanner] Scan complete: Score ${score}/100, ${issues.length} issues found`);
+
     return {
       url: targetUrl.href,
       finalUrl,
       score,
-      screenshot: screenshotBase64,
-      issues,
+      screenshot: screenshotDataUrl,
+      meta: {
+        title: pageData.title || '',
+        description: pageData.metaDescription || '',
+      },
       techStack,
+      issues,
     };
   } finally {
     if (browser) {
@@ -775,7 +871,7 @@ async function deepCrawl(inputUrl) {
         } catch (error) {
           console.warn(`[DeepCrawler] Failed to load ${link}: ${error.message}`);
           return null;
-        } finally {
+  } finally {
           await page.close().catch(() => {});
         }
       });
