@@ -364,7 +364,10 @@ async function performScan(inputUrl) {
  * Extract content from a single page
  */
 async function extractPageContent(page, baseUrl) {
-  return await page.evaluate((base) => {
+  return await page.evaluate(() => {
+    // CRITICAL: Use the CURRENT page URL as base for resolving relative URLs
+    const currentPageUrl = window.location.href;
+    
     // Helper functions inside browser context
     function extractEmails(text) {
       const emailRegex = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b/g;
@@ -380,7 +383,9 @@ async function extractPageContent(page, baseUrl) {
 
     function resolveUrl(relativeUrl) {
       try {
-        return new URL(relativeUrl, base).href;
+        // Use CURRENT page URL for proper resolution
+        const absoluteUrl = new URL(relativeUrl, currentPageUrl).href;
+        return absoluteUrl;
       } catch {
         return relativeUrl;
       }
@@ -433,15 +438,24 @@ async function extractPageContent(page, baseUrl) {
 
     // Helper: Add image if valid and not duplicate
     function addImage(url, width, height, alt = '') {
-      if (!url || seenUrls.has(url)) return;
+      if (!url || typeof url !== 'string') return;
       
-      // Must be absolute URL
+      // Clean the URL (remove quotes, spaces)
+      url = url.trim();
+      
+      // ALWAYS resolve to absolute URL
       if (!url.startsWith('http://') && !url.startsWith('https://')) {
         url = resolveUrl(url);
       }
 
+      // Skip if still not absolute after resolution
+      if (!url.startsWith('http://') && !url.startsWith('https://')) return;
+
       // Skip data URIs and SVGs
       if (url.startsWith('data:') || url.toLowerCase().endsWith('.svg')) return;
+
+      // Skip duplicates
+      if (seenUrls.has(url)) return;
 
       // Skip tiny tracking pixels
       if (width > 0 && height > 0 && (width < 50 || height < 50)) return;
@@ -526,7 +540,9 @@ async function extractPageContent(page, baseUrl) {
     });
 
     // Sort by area (largest first) and take top 10
+    // FINAL SAFETY CHECK: Only return absolute URLs
     const sortedImages = images
+      .filter(img => img.url && (img.url.startsWith('http://') || img.url.startsWith('https://')))
       .sort((a, b) => b.area - a.area)
       .slice(0, 10)
       .map(img => ({
@@ -552,7 +568,7 @@ async function extractPageContent(page, baseUrl) {
     });
 
     return {
-      url: window.location.href,
+      url: currentPageUrl,
       title,
       headings,
       content: content.substring(0, 3000), // First 3000 chars
@@ -560,19 +576,21 @@ async function extractPageContent(page, baseUrl) {
       emails: [...new Set(emails)],
       phones: [...new Set(phones)],
     };
-  }, baseUrl);
+  });
 }
 
 /**
  * Discover internal links from a page
  */
 async function discoverLinks(page, baseUrl) {
-  return await page.evaluate((base) => {
+  return await page.evaluate(() => {
+    const currentPageUrl = window.location.href;
+    const currentHostname = new URL(currentPageUrl).hostname;
+    
     function isInternalUrl(testUrl) {
       try {
-        const baseObj = new URL(base);
-        const testObj = new URL(testUrl, base);
-        return baseObj.hostname === testObj.hostname;
+        const testObj = new URL(testUrl, currentPageUrl);
+        return testObj.hostname === currentHostname;
       } catch {
         return false;
       }
@@ -591,7 +609,7 @@ async function discoverLinks(page, baseUrl) {
       }
 
       try {
-        const absoluteUrl = new URL(href, base).href;
+        const absoluteUrl = new URL(href, currentPageUrl).href;
         
         // Only include internal links
         if (isInternalUrl(absoluteUrl)) {
@@ -609,7 +627,7 @@ async function discoverLinks(page, baseUrl) {
     });
 
     return Array.from(links);
-  }, baseUrl);
+  });
 }
 
 /**
@@ -617,24 +635,36 @@ async function discoverLinks(page, baseUrl) {
  */
 async function extractSocials(page) {
   return await page.evaluate(() => {
+    const currentPageUrl = window.location.href;
     const socials = [];
     const links = Array.from(document.querySelectorAll('a'));
     
     links.forEach(a => {
-      const href = (a.href || '').toLowerCase();
+      const hrefAttr = a.getAttribute('href');
+      if (!hrefAttr) return;
+      
+      // Resolve to absolute URL
+      let absoluteUrl;
+      try {
+        absoluteUrl = new URL(hrefAttr, currentPageUrl).href;
+      } catch {
+        return;
+      }
+      
+      const href = absoluteUrl.toLowerCase();
       
       if (href.includes('facebook.com/') && !href.includes('/sharer')) {
-        socials.push({ platform: 'Facebook', url: a.href });
+        socials.push({ platform: 'Facebook', url: absoluteUrl });
       } else if (href.includes('instagram.com/')) {
-        socials.push({ platform: 'Instagram', url: a.href });
+        socials.push({ platform: 'Instagram', url: absoluteUrl });
       } else if (href.includes('linkedin.com/')) {
-        socials.push({ platform: 'LinkedIn', url: a.href });
+        socials.push({ platform: 'LinkedIn', url: absoluteUrl });
       } else if (href.includes('twitter.com/') || href.includes('x.com/')) {
-        socials.push({ platform: 'Twitter', url: a.href });
+        socials.push({ platform: 'Twitter', url: absoluteUrl });
       } else if (href.includes('youtube.com/') || href.includes('youtu.be/')) {
-        socials.push({ platform: 'YouTube', url: a.href });
+        socials.push({ platform: 'YouTube', url: absoluteUrl });
       } else if (href.includes('xing.com/')) {
-        socials.push({ platform: 'XING', url: a.href });
+        socials.push({ platform: 'XING', url: absoluteUrl });
       }
     });
 
@@ -692,6 +722,10 @@ async function deepCrawl(inputUrl) {
 
     // Extract homepage content
     const homeContent = await extractPageContent(homePage, baseUrl);
+    console.log(`[DeepCrawler] Homepage extracted: ${homeContent.images.length} images found`);
+    if (homeContent.images.length > 0) {
+      console.log(`[DeepCrawler] Sample image URLs:`, homeContent.images.slice(0, 3).map(img => img.url));
+    }
     
     // Discover links
     const discoveredLinks = await discoverLinks(homePage, baseUrl);
@@ -775,7 +809,10 @@ async function deepCrawl(inputUrl) {
         title: page.title,
         headings: page.headings,
         content: page.content,
-        images: page.images.map(img => img.url), // Just return URLs
+        // SAFETY: Only return absolute URLs (filter out any relative paths that slipped through)
+        images: page.images
+          .map(img => img.url)
+          .filter(url => url && (url.startsWith('http://') || url.startsWith('https://'))),
       })),
       metadata: {
         pagesVisited: allPages.length,
