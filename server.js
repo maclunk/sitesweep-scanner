@@ -150,12 +150,12 @@ async function performScan(inputUrl) {
   try {
     const targetUrl = normalizeUrl(inputUrl);
     console.log(`[EliteScanner] Starting scan for ${targetUrl.href}`);
-
-    browser = await chromium.launch({
-      headless: true,
+    
+    browser = await chromium.launch({ 
+      headless: true, 
       args: HEADLESS_ARGS,
     });
-
+    
     const context = await browser.newContext({
       viewport: { width: 1920, height: 1080 },
       userAgent: USER_AGENT,
@@ -189,10 +189,10 @@ async function performScan(inputUrl) {
         }
       }
     });
-
+    
     const page = await context.newPage();
     page.setDefaultTimeout(SCAN_TIMEOUT_MS);
-
+    
     try {
       await page.goto(targetUrl.href, {
         waitUntil: 'domcontentloaded',
@@ -211,11 +211,11 @@ async function performScan(inputUrl) {
         return 'http:';
       }
     })();
-
+    
     const pageData = await page.evaluate(() => {
       const html = document.documentElement?.innerHTML || '';
       const lowerHtml = html.toLowerCase();
-
+      
       const anchors = Array.from(document.querySelectorAll('a'));
       const hasImpressumLink = anchors.some((a) =>
         (a.textContent || '').toLowerCase().includes('impressum')
@@ -258,37 +258,37 @@ async function performScan(inputUrl) {
 
     let score = 100;
     const issues = [];
-
+    
     const applyPenalty = (amount) => {
       score = Math.max(0, score - amount);
     };
-
+    
     if (finalProtocol !== 'https:') {
       issues.push(
         buildIssue('security', 'high', 'Webseite ist nicht verschlüsselt (kein HTTPS).')
       );
       applyPenalty(40);
     }
-
+    
     if (!pageData.hasViewportMeta) {
       issues.push(
         buildIssue('mobile', 'high', 'Kein responsiver Viewport-Meta-Tag gefunden.')
       );
       applyPenalty(20);
     }
-
+    
     if (!pageData.hasImpressumLink) {
       issues.push(
         buildIssue('legal', 'critical', 'Kein Impressum-Link gefunden.')
       );
       applyPenalty(30);
     }
-
+    
     if (gdprFindings.googleFonts) {
       issues.push(
         buildIssue(
-          'gdpr',
-          'high',
+          'gdpr', 
+          'high', 
           'Google Fonts werden extern geladen (mögliche DSGVO-Verletzung).'
         )
       );
@@ -322,7 +322,7 @@ async function performScan(inputUrl) {
       );
       applyPenalty(5);
     }
-
+    
     let screenshotBase64 = null;
     try {
       const screenshotBuffer = await page.screenshot({
@@ -424,28 +424,117 @@ async function extractPageContent(page, baseUrl) {
     // Clean content: remove excessive whitespace
     content = content.replace(/\s+/g, ' ').trim();
 
-    // Extract images with FULL URL resolution
+    // ========================================================================
+    // ADVANCED IMAGE EXTRACTION (Handles Old Websites)
+    // ========================================================================
+    
     const images = [];
-    Array.from(document.querySelectorAll('img')).forEach(img => {
-      const src = img.src || img.getAttribute('src');
-      if (!src) return;
+    const seenUrls = new Set();
 
-      // Resolve relative URLs
-      const absoluteSrc = resolveUrl(src);
+    // Helper: Add image if valid and not duplicate
+    function addImage(url, width, height, alt = '') {
+      if (!url || seenUrls.has(url)) return;
       
-      const width = img.naturalWidth || img.width || 0;
-      const height = img.naturalHeight || img.height || 0;
+      // Must be absolute URL
+      if (!url.startsWith('http://') && !url.startsWith('https://')) {
+        url = resolveUrl(url);
+      }
 
-      // Filter out tiny icons (< 50px)
-      if (width >= 50 && height >= 50) {
-        images.push({
-          url: absoluteSrc,
-          alt: img.alt || '',
-          width,
-          height,
+      // Skip data URIs and SVGs
+      if (url.startsWith('data:') || url.toLowerCase().endsWith('.svg')) return;
+
+      // Skip tiny tracking pixels
+      if (width > 0 && height > 0 && (width < 50 || height < 50)) return;
+
+      seenUrls.add(url);
+      images.push({
+        url,
+        alt,
+        width: width || 0,
+        height: height || 0,
+        area: (width || 0) * (height || 0),
+      });
+    }
+
+    // 1. Extract from <img> tags (standard + lazy loading)
+    Array.from(document.querySelectorAll('img')).forEach(img => {
+      // Try multiple sources (lazy loading support)
+      const src = 
+        img.currentSrc ||
+        img.src ||
+        img.getAttribute('data-src') ||
+        img.getAttribute('data-lazy-src') ||
+        img.getAttribute('data-original') ||
+        img.getAttribute('src');
+
+      if (src) {
+        const width = img.naturalWidth || img.width || 0;
+        const height = img.naturalHeight || img.height || 0;
+        addImage(src, width, height, img.alt);
+      }
+
+      // Also check srcset for responsive images
+      const srcset = img.getAttribute('srcset');
+      if (srcset) {
+        // Parse srcset: "image1.jpg 800w, image2.jpg 1200w"
+        const srcsetUrls = srcset.split(',').map(s => s.trim().split(/\s+/)[0]);
+        srcsetUrls.forEach(url => {
+          if (url) addImage(url, img.width, img.height, img.alt);
         });
       }
     });
+
+    // 2. Extract CSS background images (hero images, banners)
+    const elementsWithBackgrounds = [
+      ...Array.from(document.querySelectorAll('div')),
+      ...Array.from(document.querySelectorAll('section')),
+      ...Array.from(document.querySelectorAll('header')),
+      ...Array.from(document.querySelectorAll('.hero')),
+      ...Array.from(document.querySelectorAll('.banner')),
+    ];
+
+    elementsWithBackgrounds.forEach(el => {
+      try {
+        const style = window.getComputedStyle(el);
+        const bgImage = style.backgroundImage;
+        
+        if (bgImage && bgImage !== 'none') {
+          // Extract URL from: url("path/to/image.jpg")
+          const match = bgImage.match(/url\(['"]?([^'"]+)['"]?\)/);
+          if (match && match[1]) {
+            const url = match[1];
+            // Use element dimensions as image size estimate
+            const width = el.offsetWidth || 0;
+            const height = el.offsetHeight || 0;
+            addImage(url, width, height);
+          }
+        }
+      } catch {
+        // Skip elements that cause errors
+      }
+    });
+
+    // 3. Extract from <picture> elements
+    Array.from(document.querySelectorAll('picture source')).forEach(source => {
+      const srcset = source.getAttribute('srcset');
+      if (srcset) {
+        const urls = srcset.split(',').map(s => s.trim().split(/\s+/)[0]);
+        urls.forEach(url => {
+          if (url) addImage(url, 0, 0);
+        });
+      }
+    });
+
+    // Sort by area (largest first) and take top 10
+    const sortedImages = images
+      .sort((a, b) => b.area - a.area)
+      .slice(0, 10)
+      .map(img => ({
+        url: img.url,
+        alt: img.alt,
+        width: img.width,
+        height: img.height,
+      }));
 
     // Extract contact info
     const emails = extractEmails(bodyText);
@@ -467,7 +556,7 @@ async function extractPageContent(page, baseUrl) {
       title,
       headings,
       content: content.substring(0, 3000), // First 3000 chars
-      images: images.slice(0, 20), // Max 20 images per page
+      images: sortedImages, // Top 10 largest images with absolute URLs
       emails: [...new Set(emails)],
       phones: [...new Set(phones)],
     };
