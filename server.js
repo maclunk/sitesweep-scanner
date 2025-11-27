@@ -165,7 +165,18 @@ async function performScan(inputUrl) {
     const gdprFindings = {
       googleFonts: false,
       googleMaps: false,
+      googleAnalytics: false,
     };
+
+    // STRICT AUDITOR: Quality tracking
+    const qualityFindings = {
+      brokenResources: [],
+      consoleErrors: [],
+      pageErrors: [],
+    };
+
+    // Track HTTP requests for mixed content detection
+    const httpRequests = [];
 
     await context.route('**/*', async (route) => {
       try {
@@ -177,6 +188,10 @@ async function performScan(inputUrl) {
 
         if (/maps\.googleapis\.com/i.test(reqUrl) || /maps\.gstatic\.com/i.test(reqUrl)) {
           gdprFindings.googleMaps = true;
+        }
+
+        if (/google-analytics\.com|googletagmanager\.com/i.test(reqUrl)) {
+          gdprFindings.googleAnalytics = true;
         }
 
         await route.continue();
@@ -192,6 +207,39 @@ async function performScan(inputUrl) {
     
     const page = await context.newPage();
     page.setDefaultTimeout(SCAN_TIMEOUT_MS);
+
+    // STRICT AUDITOR: Listen for console errors
+    page.on('console', (msg) => {
+      if (msg.type() === 'error') {
+        qualityFindings.consoleErrors.push(msg.text());
+      }
+    });
+
+    // STRICT AUDITOR: Listen for page errors (uncaught exceptions)
+    page.on('pageerror', (error) => {
+      qualityFindings.pageErrors.push(error.message);
+    });
+
+    // STRICT AUDITOR: Listen for failed requests and HTTP on HTTPS
+    page.on('response', async (response) => {
+      try {
+        const status = response.status();
+        const url = response.url();
+        const resourceType = response.request().resourceType();
+
+        // Track HTTP requests for mixed content
+        if (url.startsWith('http://') && ['image', 'stylesheet', 'script', 'font'].includes(resourceType)) {
+          httpRequests.push({ url, type: resourceType });
+        }
+
+        // Detect 404s on important resources
+        if (status === 404 && ['image', 'stylesheet', 'script', 'font'].includes(resourceType)) {
+          qualityFindings.brokenResources.push({ url, status, type: resourceType });
+        }
+      } catch {
+        // Ignore errors in response handler
+      }
+    });
     
     try {
       await page.goto(targetUrl.href, {
@@ -216,7 +264,62 @@ async function performScan(inputUrl) {
       const html = document.documentElement?.innerHTML || '';
       const lowerHtml = html.toLowerCase();
       
+      // ========================================================================
+      // STRICT AUDITOR: "Old School" HTML Detection
+      // ========================================================================
+      
+      const deprecatedTags = {
+        font: document.querySelectorAll('font').length,
+        center: document.querySelectorAll('center').length,
+        frameset: document.querySelectorAll('frameset').length,
+        marquee: document.querySelectorAll('marquee').length,
+        tableLayout: Array.from(document.querySelectorAll('table[border]')).filter(
+          table => !table.closest('[role="table"]')
+        ).length,
+      };
+      
+      const hasDeprecatedHTML = 
+        deprecatedTags.font > 0 || 
+        deprecatedTags.center > 0 || 
+        deprecatedTags.frameset > 0 || 
+        deprecatedTags.marquee > 0 || 
+        deprecatedTags.tableLayout > 0;
+
+      // ========================================================================
+      // STRICT AUDITOR: Font Size Check (Accessibility)
+      // ========================================================================
+      
+      let minFontSize = 16;
+      try {
+        const bodyElement = document.body;
+        if (bodyElement) {
+          const computed = window.getComputedStyle(bodyElement);
+          const fontSize = parseFloat(computed.fontSize);
+          if (!isNaN(fontSize)) {
+            minFontSize = fontSize;
+          }
+        }
+
+        // Check common text elements
+        const textElements = Array.from(document.querySelectorAll('p, li, span, div, a'));
+        const fontSizes = textElements.slice(0, 50).map(el => {
+          const style = window.getComputedStyle(el);
+          return parseFloat(style.fontSize);
+        }).filter(size => !isNaN(size) && size > 0);
+
+        if (fontSizes.length > 0) {
+          minFontSize = Math.min(...fontSizes);
+        }
+      } catch {
+        // Ignore font size detection errors
+      }
+
+      const hasTinyFonts = minFontSize < 14;
+
+      // ========================================================================
       // Legal compliance checks
+      // ========================================================================
+      
       const anchors = Array.from(document.querySelectorAll('a'));
       const hasImpressumLink = anchors.some((a) =>
         (a.textContent || '').toLowerCase().includes('impressum')
@@ -277,6 +380,11 @@ async function performScan(inputUrl) {
         totalImages,
         imagesWithoutAlt,
         techStack: Array.from(techStackSet),
+        // STRICT AUDITOR data
+        deprecatedTags,
+        hasDeprecatedHTML,
+        minFontSize,
+        hasTinyFonts,
       };
     });
 
@@ -361,6 +469,118 @@ async function performScan(inputUrl) {
         )
       );
       applyPenalty(10);
+    }
+
+    if (gdprFindings.googleAnalytics) {
+      issues.push(
+        buildIssue(
+          'gdpr',
+          'medium',
+          'Google Analytics erkannt',
+          'Google Analytics erkannt. Stellen Sie sicher, dass ein Cookie-Banner aktiv ist.'
+        )
+      );
+      applyPenalty(5);
+    }
+
+    // ========================================================================
+    // STRICT AUDITOR CHECKS - Findet alte/kaputte Websites
+    // ========================================================================
+
+    let hasOldSchoolHTML = false;
+
+    // --- 1. DEPRECATED HTML TAGS (Old School Website) ---
+    
+    if (pageData.hasDeprecatedHTML) {
+      hasOldSchoolHTML = true;
+      
+      const deprecatedDetails = [];
+      if (pageData.deprecatedTags.font > 0) deprecatedDetails.push(`<font> Tags (${pageData.deprecatedTags.font})`);
+      if (pageData.deprecatedTags.center > 0) deprecatedDetails.push(`<center> Tags (${pageData.deprecatedTags.center})`);
+      if (pageData.deprecatedTags.marquee > 0) deprecatedDetails.push(`<marquee> Tags (${pageData.deprecatedTags.marquee})`);
+      if (pageData.deprecatedTags.frameset > 0) deprecatedDetails.push(`<frameset> Tags (${pageData.deprecatedTags.frameset})`);
+      if (pageData.deprecatedTags.tableLayout > 0) deprecatedDetails.push(`Tabellen-Layout (${pageData.deprecatedTags.tableLayout})`);
+      
+      issues.push(
+        buildIssue(
+          'tech',
+          'critical',
+          'Veraltete Technik (HTML4)',
+          `Diese Seite ist technisch auf dem Stand von vor 10+ Jahren. Gefunden: ${deprecatedDetails.join(', ')}. Diese Technik wird seit 2010 nicht mehr empfohlen.`
+        )
+      );
+      applyPenalty(30);
+    }
+
+    // --- 2. JAVASCRIPT ERRORS ---
+    
+    if (qualityFindings.consoleErrors.length > 0 || qualityFindings.pageErrors.length > 0) {
+      const totalErrors = qualityFindings.consoleErrors.length + qualityFindings.pageErrors.length;
+      const errorSamples = [
+        ...qualityFindings.pageErrors.slice(0, 2),
+        ...qualityFindings.consoleErrors.slice(0, 2)
+      ].map(err => err.substring(0, 100)).join('; ');
+      
+      issues.push(
+        buildIssue(
+          'tech',
+          'high',
+          'JavaScript-Fehler erkannt',
+          `${totalErrors} JavaScript-Fehler während des Ladens erkannt. Funktionen der Seite könnten defekt sein. Beispiele: ${errorSamples || 'Siehe Browser-Konsole'}`
+        )
+      );
+      applyPenalty(15);
+    }
+
+    // --- 3. TINY FONTS (Readability) ---
+    
+    if (pageData.hasTinyFonts) {
+      issues.push(
+        buildIssue(
+          'accessibility',
+          'medium',
+          'Schriftgröße zu klein',
+          `Schriftgröße ist zu klein (${Math.round(pageData.minFontSize)}px gefunden). Empfohlen sind mindestens 14-16px für gute Lesbarkeit auf Mobilgeräten.`
+        )
+      );
+      applyPenalty(10);
+    }
+
+    // --- 4. BROKEN RESOURCES (404 Errors) ---
+    
+    if (qualityFindings.brokenResources.length > 0) {
+      const brokenCount = qualityFindings.brokenResources.length;
+      const brokenTypes = [...new Set(qualityFindings.brokenResources.map(r => r.type))].join(', ');
+      const examples = qualityFindings.brokenResources.slice(0, 2)
+        .map(r => r.url.split('/').pop())
+        .join(', ');
+      
+      issues.push(
+        buildIssue(
+          'tech',
+          'high',
+          'Defekte Ressourcen',
+          `${brokenCount} Ressourcen konnten nicht geladen werden (404 Fehler). Typen: ${brokenTypes}. Beispiele: ${examples}`
+        )
+      );
+      applyPenalty(10);
+    }
+
+    // --- 5. MIXED CONTENT (HTTP on HTTPS) ---
+    
+    if (finalProtocol === 'https:' && httpRequests.length > 0) {
+      const mixedCount = httpRequests.length;
+      const mixedTypes = [...new Set(httpRequests.map(r => r.type))].join(', ');
+      
+      issues.push(
+        buildIssue(
+          'security',
+          'high',
+          'Unsichere Inhalte (Mixed Content)',
+          `${mixedCount} Ressourcen werden über unsicheres HTTP geladen, obwohl die Seite HTTPS nutzt. Das grüne Schloss im Browser verschwindet. Typen: ${mixedTypes}`
+        )
+      );
+      applyPenalty(20);
     }
 
     // --- SEO CHECKS ---
@@ -478,6 +698,26 @@ async function performScan(inputUrl) {
         )
       );
       applyPenalty(5);
+    }
+
+    // ========================================================================
+    // STRICT AUDITOR: Final Score Cap
+    // ========================================================================
+    
+    // If old school HTML detected, MAX score is 50 (website is fundamentally outdated)
+    if (hasOldSchoolHTML && score > 50) {
+      const scoreBefore = score;
+      score = 50;
+      console.log(`[StrictAuditor] Score capped at 50 due to deprecated HTML (was ${scoreBefore})`);
+      
+      issues.push(
+        buildIssue(
+          'tech',
+          'critical',
+          'Score auf 50 begrenzt',
+          'Aufgrund der veralteten HTML-Technik wurde der Score auf maximal 50 Punkte begrenzt. Eine technische Überarbeitung ist dringend empfohlen.'
+        )
+      );
     }
     
     // Screenshot capture with proper format
