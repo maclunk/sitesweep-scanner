@@ -269,8 +269,21 @@ async function performScan(inputUrl) {
         timeout: SCAN_TIMEOUT_MS,
       });
       await page.waitForLoadState('networkidle', { timeout: SCAN_TIMEOUT_MS }).catch(() => {});
-    } catch {
-      throw new Error('Target site unreachable or timed out.');
+    } catch (navError) {
+      // Provide detailed error message
+      const errorMsg = navError.message || '';
+      
+      if (errorMsg.includes('net::ERR_NAME_NOT_RESOLVED')) {
+        throw new Error(`Website nicht gefunden: Die Domain "${targetUrl.hostname}" existiert nicht oder ist nicht erreichbar.`);
+      } else if (errorMsg.includes('net::ERR_CONNECTION_REFUSED')) {
+        throw new Error(`Verbindung abgelehnt: Der Server unter "${targetUrl.hostname}" verweigert die Verbindung.`);
+      } else if (errorMsg.includes('net::ERR_CONNECTION_TIMED_OUT') || errorMsg.includes('Timeout')) {
+        throw new Error(`Timeout: Die Website "${targetUrl.hostname}" antwortet nicht innerhalb von 30 Sekunden.`);
+      } else if (errorMsg.includes('net::ERR_SSL_PROTOCOL_ERROR')) {
+        throw new Error(`SSL-Fehler: Die Website "${targetUrl.hostname}" hat ein ungültiges SSL-Zertifikat.`);
+      } else {
+        throw new Error(`Website nicht erreichbar: ${targetUrl.hostname} - ${errorMsg}`);
+      }
     }
 
     const finalUrl = page.url();
@@ -1147,7 +1160,22 @@ async function deepCrawl(inputUrl) {
       await homePage.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
     } catch (navError) {
       console.error(`[DeepCrawler] Failed to load homepage: ${navError.message}`);
-      throw new Error('Target site unreachable or timed out.');
+      
+      // Provide detailed error message
+      const errorMsg = navError.message || '';
+      const hostname = new URL(baseUrl).hostname;
+      
+      if (errorMsg.includes('net::ERR_NAME_NOT_RESOLVED')) {
+        throw new Error(`Website nicht gefunden: Die Domain "${hostname}" existiert nicht oder ist nicht erreichbar.`);
+      } else if (errorMsg.includes('net::ERR_CONNECTION_REFUSED')) {
+        throw new Error(`Verbindung abgelehnt: Der Server unter "${hostname}" verweigert die Verbindung.`);
+      } else if (errorMsg.includes('net::ERR_CONNECTION_TIMED_OUT') || errorMsg.includes('Timeout')) {
+        throw new Error(`Timeout: Die Website "${hostname}" antwortet nicht innerhalb von 10 Sekunden.`);
+      } else if (errorMsg.includes('net::ERR_SSL_PROTOCOL_ERROR')) {
+        throw new Error(`SSL-Fehler: Die Website "${hostname}" hat ein ungültiges SSL-Zertifikat.`);
+      } else {
+        throw new Error(`Website nicht erreichbar: ${hostname} - ${errorMsg}`);
+      }
     }
 
     // Extract homepage content
@@ -1295,16 +1323,28 @@ app.post('/scan', async (req, res) => {
     console.error('[EliteScanner] Scan failed:', error);
 
     const message = error && error.message ? error.message : 'Scan failed';
+    
+    // Determine error type and appropriate status code
     const isUserError =
       message.includes('URL is required') ||
       message.includes('Invalid URL') ||
       message.includes('Only HTTP/HTTPS protocols are allowed.');
+    
+    const isNetworkError =
+      message.includes('nicht gefunden') ||
+      message.includes('nicht erreichbar') ||
+      message.includes('Verbindung abgelehnt') ||
+      message.includes('Timeout') ||
+      message.includes('SSL-Fehler');
 
-    const status = isUserError
-      ? 400
-      : message.includes('unreachable') || message.includes('timeout')
-      ? 502
-      : 500;
+    let status;
+    if (isUserError) {
+      status = 400; // Bad Request
+    } else if (isNetworkError) {
+      status = 502; // Bad Gateway (target site problem)
+    } else {
+      status = 500; // Internal Server Error
+    }
 
     res.status(status).json({ error: message });
   }
@@ -1331,16 +1371,28 @@ app.post('/harvest', async (req, res) => {
     console.error('[DeepCrawler] Harvest failed:', error);
 
     const message = error && error.message ? error.message : 'Harvest failed';
+    
+    // Determine error type and appropriate status code
     const isUserError =
       message.includes('URL is required') ||
       message.includes('Invalid URL') ||
       message.includes('Only HTTP/HTTPS protocols are allowed.');
+    
+    const isNetworkError =
+      message.includes('nicht gefunden') ||
+      message.includes('nicht erreichbar') ||
+      message.includes('Verbindung abgelehnt') ||
+      message.includes('Timeout') ||
+      message.includes('SSL-Fehler');
 
-    const status = isUserError
-      ? 400
-      : message.includes('unreachable') || message.includes('timeout')
-      ? 502
-      : 500;
+    let status;
+    if (isUserError) {
+      status = 400; // Bad Request
+    } else if (isNetworkError) {
+      status = 502; // Bad Gateway (target site problem)
+    } else {
+      status = 500; // Internal Server Error
+    }
 
     res.status(status).json({ error: message });
   }
