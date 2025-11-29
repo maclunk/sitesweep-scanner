@@ -42,15 +42,26 @@ app.use(express.json());
 
 /**
  * Normalize and validate user URL input.
+ * Accepts lazy inputs like:
+ * - "example.com" → "https://example.com"
+ * - "www.example.com" → "https://www.example.com"
+ * - "http://example.com" → "http://example.com" (kept as is)
+ * 
+ * @param {string} rawUrl - Raw URL input from user
+ * @returns {URL} - Validated URL object
  */
 function normalizeUrl(rawUrl = '') {
+  // Trim whitespace
   const trimmed = String(rawUrl || '').trim();
+  
   if (!trimmed) {
     throw new Error('URL is required');
   }
 
+  // Add https:// if no protocol specified
   const withProtocol = /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 
+  // Validate URL
   let url;
   try {
     url = new URL(withProtocol);
@@ -58,11 +69,22 @@ function normalizeUrl(rawUrl = '') {
     throw new Error('Invalid URL. Provide a valid http(s) URL.');
   }
 
+  // Only allow HTTP/HTTPS
   if (!['http:', 'https:'].includes(url.protocol)) {
     throw new Error('Only HTTP/HTTPS protocols are allowed.');
   }
 
   return url;
+}
+
+/**
+ * Normalize URL and return as string (for convenience)
+ * @param {string} rawUrl - Raw URL input
+ * @returns {string} - Normalized URL as string
+ */
+function normalizeUrlString(rawUrl) {
+  const url = normalizeUrl(rawUrl);
+  return url.href;
 }
 
 /**
@@ -1254,10 +1276,16 @@ app.get('/health', (_req, res) => {
 
 app.post('/scan', async (req, res) => {
   try {
-    const url = req.body && req.body.url;
+    // Validate and normalize URL immediately (accepts lazy inputs like "example.com")
+    const rawUrl = req.body && req.body.url;
+    
+    // This will throw if URL is invalid or missing
+    const normalizedUrl = normalizeUrlString(rawUrl);
+    
+    console.log(`[API] Scan request: ${rawUrl} → ${normalizedUrl}`);
 
     const result = await withTimeout(
-      performScan(url),
+      performScan(rawUrl), // Pass original - performScan will normalize it again (but that's OK)
       SCAN_TIMEOUT_MS,
       'Scan timeout after 30 seconds.'
     );
@@ -1284,10 +1312,16 @@ app.post('/scan', async (req, res) => {
 
 app.post('/harvest', async (req, res) => {
   try {
-    const url = req.body && req.body.url;
+    // Validate and normalize URL immediately (accepts lazy inputs like "example.com")
+    const rawUrl = req.body && req.body.url;
+    
+    // This will throw if URL is invalid or missing
+    const normalizedUrl = normalizeUrlString(rawUrl);
+    
+    console.log(`[API] Harvest request: ${rawUrl} → ${normalizedUrl}`);
 
     const result = await withTimeout(
-      deepCrawl(url),
+      deepCrawl(rawUrl), // Pass original - deepCrawl will normalize it again (but that's OK)
       HARVEST_TIMEOUT_MS,
       'Harvest timeout after 45 seconds.'
     );
