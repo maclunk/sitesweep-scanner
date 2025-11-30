@@ -159,6 +159,64 @@ function isInternalUrl(baseUrl, testUrl) {
   }
 }
 
+/**
+ * Smart navigation with automatic www retry
+ * Tries to load URL, and if it fails, retries with www prefix
+ */
+async function navigateWithRetry(page, url, timeout = 15000) {
+  const urlObj = new URL(url);
+  const hostname = urlObj.hostname;
+  
+  console.log(`[SmartNav] Attempting to load: ${url}`);
+  
+  try {
+    // Attempt 1: Try the URL as provided
+    await page.goto(url, {
+      waitUntil: 'domcontentloaded',
+      timeout: timeout,
+    });
+    
+    console.log(`[SmartNav] ✅ Successfully loaded: ${url}`);
+    return page.url(); // Return final URL (might be different due to redirects)
+    
+  } catch (error) {
+    const errorMsg = error.message || '';
+    console.log(`[SmartNav] ❌ First attempt failed: ${errorMsg.substring(0, 100)}`);
+    
+    // Check if it's a network error (not a timeout or other error)
+    const isNetworkError = 
+      errorMsg.includes('net::ERR_NAME_NOT_RESOLVED') ||
+      errorMsg.includes('net::ERR_CONNECTION_REFUSED') ||
+      errorMsg.includes('net::ERR_CONNECTION_TIMED_OUT');
+    
+    // If it's a network error and URL doesn't have www, try with www
+    if (isNetworkError && !hostname.startsWith('www.')) {
+      const wwwUrl = urlObj.protocol + '//www.' + hostname + urlObj.pathname + urlObj.search + urlObj.hash;
+      
+      console.log(`[SmartNav] 🔄 Retrying with www: ${wwwUrl}`);
+      
+      try {
+        // Attempt 2: Try with www prefix
+        await page.goto(wwwUrl, {
+          waitUntil: 'domcontentloaded',
+          timeout: timeout,
+        });
+        
+        console.log(`[SmartNav] ✅ Successfully loaded with www: ${wwwUrl}`);
+        return page.url(); // Return final URL
+        
+      } catch (wwwError) {
+        console.log(`[SmartNav] ❌ Both attempts failed`);
+        // Both failed, throw original error
+        throw error;
+      }
+    } else {
+      // Not a network error or already has www, throw error
+      throw error;
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Core scan logic (existing /scan endpoint)
 // ---------------------------------------------------------------------------
@@ -263,17 +321,14 @@ async function performScan(inputUrl) {
       }
     });
     
+    // Smart navigation with automatic www retry
+    let finalUrl;
     try {
-      await page.goto(targetUrl.href, {
-        waitUntil: 'domcontentloaded',
-        timeout: SCAN_TIMEOUT_MS,
-      });
+      finalUrl = await navigateWithRetry(page, targetUrl.href, SCAN_TIMEOUT_MS);
       await page.waitForLoadState('networkidle', { timeout: SCAN_TIMEOUT_MS }).catch(() => {});
     } catch {
       throw new Error('Target site unreachable or timed out.');
     }
-
-    const finalUrl = page.url();
     const finalProtocol = (() => {
       try {
         return new URL(finalUrl).protocol;
@@ -1134,17 +1189,16 @@ async function deepCrawl(inputUrl) {
       userAgent: USER_AGENT,
     });
 
-    // Step 1: Visit homepage
+    // Step 1: Visit homepage with smart navigation
     console.log(`[DeepCrawler] Visiting homepage: ${baseUrl}`);
     const homePage = await context.newPage();
     homePage.setDefaultTimeout(10000);
 
+    let actualBaseUrl;
     try {
-      await homePage.goto(baseUrl, {
-        waitUntil: 'domcontentloaded',
-        timeout: 10000,
-      });
+      actualBaseUrl = await navigateWithRetry(homePage, baseUrl, 10000);
       await homePage.waitForLoadState('networkidle', { timeout: 10000 }).catch(() => {});
+      console.log(`[DeepCrawler] Successfully loaded: ${actualBaseUrl}`);
     } catch (navError) {
       console.error(`[DeepCrawler] Failed to load homepage: ${navError.message}`);
       throw new Error('Target site unreachable or timed out.');
