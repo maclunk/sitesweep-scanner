@@ -322,6 +322,8 @@ async function performScan(inputUrl) {
     });
     
     // Smart navigation with automatic www retry
+    // IMPORTANT: finalUrl is used for ALL checks (SSL, redirects, etc.)
+    // This ensures consistent results regardless of input URL vs redirected URL
     let finalUrl;
     try {
       finalUrl = await navigateWithRetry(page, targetUrl.href, SCAN_TIMEOUT_MS);
@@ -329,6 +331,8 @@ async function performScan(inputUrl) {
     } catch {
       throw new Error('Target site unreachable or timed out.');
     }
+    
+    // Extract protocol from FINAL URL (after redirects)
     const finalProtocol = (() => {
       try {
         return new URL(finalUrl).protocol;
@@ -816,11 +820,18 @@ async function performScan(inputUrl) {
 
     const techStack = Array.from(new Set(pageData.techStack || []));
 
+    // Check if redirected
+    const wasRedirected = targetUrl.href !== finalUrl;
+    
     console.log(`[EliteScanner] Scan complete: Score ${score}/100, ${issues.length} issues found`);
+    if (wasRedirected) {
+      console.log(`[EliteScanner] Redirected: ${targetUrl.href} → ${finalUrl}`);
+    }
 
     return {
       url: targetUrl.href,
       finalUrl,
+      redirected: wasRedirected,
       score,
       screenshot: screenshotDataUrl,
       meta: {
@@ -1280,8 +1291,14 @@ async function deepCrawl(inputUrl) {
       page.phones.forEach(p => globalPhones.add(p));
     });
 
+    // Check if redirected
+    const wasRedirected = baseUrl !== actualBaseUrl;
+    
     // Build final response
     const result = {
+      url: baseUrl,
+      finalUrl: actualBaseUrl,
+      redirected: wasRedirected,
       domain,
       global: {
         emails: Array.from(globalEmails),
@@ -1306,6 +1323,9 @@ async function deepCrawl(inputUrl) {
     };
 
     console.log(`[DeepCrawler] Crawl complete: ${result.pages.length} pages, ${result.global.emails.length} emails, ${result.metadata.totalImages} images`);
+    if (wasRedirected) {
+      console.log(`[DeepCrawler] Redirected: ${baseUrl} → ${actualBaseUrl}`);
+    }
 
     return result;
 
