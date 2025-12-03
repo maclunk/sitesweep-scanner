@@ -41,6 +41,19 @@ app.use(express.json());
 // ---------------------------------------------------------------------------
 
 /**
+ * Regex patterns for detecting incomplete legal texts (template placeholders)
+ */
+const INCOMPLETE_LEGAL_PATTERNS = [
+  /Registernummer.*?folgt/i,
+  /Steuernummer.*?folgt/i,
+  /Umsatzsteuer.*?folgt/i,
+  /Steuernummer.*?beantragt/i,
+  /Inhaltlich Verantwortlicher.*?folgt/i,
+  /Max Mustermann/i,
+  /Musterstraße/i,
+];
+
+/**
  * Normalize and validate user URL input.
  * Accepts lazy inputs like:
  * - "example.com" → "https://example.com"
@@ -220,6 +233,88 @@ async function navigateWithRetry(page, url, timeout = 15000) {
 // ---------------------------------------------------------------------------
 // Core scan logic (existing /scan endpoint)
 // ---------------------------------------------------------------------------
+
+/**
+ * Check for incomplete legal texts (template placeholders)
+ * Checks homepage first, then optionally navigates to Impressum page
+ * @param {Page} page - Playwright page object
+ * @returns {Promise<{found: boolean, match?: string}>} - Result with match string if found
+ */
+async function checkIncompleteLegal(page) {
+  try {
+    // Step A: Check homepage
+    const homepageText = await page.evaluate(() => {
+      return document.body?.innerText || '';
+    });
+
+    // Check against all patterns
+    for (const pattern of INCOMPLETE_LEGAL_PATTERNS) {
+      const match = homepageText.match(pattern);
+      if (match) {
+        // Extract a snippet of the matched text (first 50 chars)
+        const snippet = match[0].substring(0, 50).trim();
+        return { found: true, match: snippet };
+      }
+    }
+
+    // Step B: If no match on homepage, try Impressum page
+    try {
+      // Find Impressum link
+      const impressumLink = await page.evaluate(() => {
+        const links = Array.from(document.querySelectorAll('a[href*="impressum"], a[href*="Impressum"]'));
+        if (links.length === 0) return null;
+        
+        const link = links[0];
+        const href = link.getAttribute('href');
+        if (!href) return null;
+        
+        // Resolve to absolute URL
+        try {
+          return new URL(href, window.location.href).href;
+        } catch {
+          return href;
+        }
+      });
+
+      if (impressumLink) {
+        console.log(`[LegalCheck] Checking Impressum page: ${impressumLink}`);
+        
+        // Navigate to Impressum (with timeout)
+        await page.goto(impressumLink, {
+          waitUntil: 'domcontentloaded',
+          timeout: 5000,
+        });
+        
+        // Wait a bit for content to load
+        await page.waitForTimeout(1000);
+        
+        // Check Impressum page text
+        const impressumText = await page.evaluate(() => {
+          return document.body?.innerText || '';
+        });
+
+        // Check against all patterns
+        for (const pattern of INCOMPLETE_LEGAL_PATTERNS) {
+          const match = impressumText.match(pattern);
+          if (match) {
+            // Extract a snippet of the matched text (first 50 chars)
+            const snippet = match[0].substring(0, 50).trim();
+            return { found: true, match: snippet };
+          }
+        }
+      }
+    } catch (impressumError) {
+      // If Impressum navigation fails, just continue (don't crash)
+      console.warn(`[LegalCheck] Failed to check Impressum: ${impressumError.message}`);
+    }
+
+    return { found: false };
+  } catch (error) {
+    // If anything fails, return false (don't crash the scan)
+    console.warn(`[LegalCheck] Error during legal check: ${error.message}`);
+    return { found: false };
+  }
+}
 
 /**
  * Perform the elite scan for a single URL.
@@ -469,6 +564,18 @@ async function performScan(inputUrl) {
       };
     });
 
+    // Check for incomplete legal texts (template placeholders)
+    const legalCheck = await checkIncompleteLegal(page);
+    
+    // If we navigated to Impressum, navigate back to original page
+    if (page.url() !== finalUrl) {
+      try {
+        await page.goto(finalUrl, { waitUntil: 'domcontentloaded', timeout: 5000 });
+      } catch {
+        // If navigation back fails, continue anyway
+      }
+    }
+
     let score = 100;
     const issues = [];
     
@@ -501,6 +608,19 @@ async function performScan(inputUrl) {
     }
     
     // --- LEGAL COMPLIANCE (Critical for German/EU) ---
+    
+    // Check for incomplete legal texts (template placeholders)
+    if (legalCheck.found) {
+      issues.push(
+        buildIssue(
+          'legal',
+          'critical',
+          'Rechtstexte unvollständig',
+          `Rechtstexte unvollständig (Platzhalter '${legalCheck.match}' gefunden). Die Website verwendet noch Template-Placeholder und ist nicht fertiggestellt.`
+        )
+      );
+      applyPenalty(40);
+    }
     
     if (!pageData.hasImpressumLink) {
       issues.push(
@@ -857,6 +977,19 @@ async function performScan(inputUrl) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Priority slugs for page selection (German business websites)
+ */
+const PRIORITY_SLUGS = [
+  'ueber-uns', 'uber-uns', 'about', 'about-us',
+  'kontakt', 'contact',
+  'team', 'mitarbeiter', 'unser-team',
+  'leistungen', 'services', 'angebot', 'produkte', 'products',
+  'impressum', 'imprint',
+  'datenschutz', 'privacy',
+  'referenzen', 'projekte', 'portfolio',
+];
+
+/**
  * Extract content from a single page
  */
 async function extractPageContent(page, baseUrl) {
@@ -887,13 +1020,134 @@ async function extractPageContent(page, baseUrl) {
       }
     }
 
+    // ========================================================================
+    // SMART CONTENT CLEANING - Removes noise, preserves structure
+    // ========================================================================
+    
+    function cleanContent() {
+      // Clone body to avoid modifying the actual page
+      const clone = document.body.cloneNode(true);
+      
+      // STEP 1: Remove noise elements
+      const noiseSelectors = [
+        'nav', 'footer', 'header', 'script', 'style', 'noscript', 'iframe',
+        '.cookie-banner', '#cookie-notice', '.cookie-consent', '#cookie-banner',
+        '.sidebar', '#sidebar', '.menu', '.navigation', '.nav',
+        '.social-share', '.share-buttons', '.breadcrumb', '.breadcrumbs',
+        '[role="navigation"]', '[role="banner"]', '[role="contentinfo"]',
+        '.widget', '.advertisement', '.ad', '.ads', '#ads',
+        '.comments', '#comments', '.comment-section',
+        '.popup', '.modal', '.overlay',
+      ];
+      
+      noiseSelectors.forEach(selector => {
+        try {
+          clone.querySelectorAll(selector).forEach(el => el.remove());
+        } catch {
+          // Ignore invalid selectors
+        }
+      });
+      
+      // STEP 2: Find main content container
+      let contentRoot = 
+        clone.querySelector('main') ||
+        clone.querySelector('article') ||
+        clone.querySelector('[role="main"]') ||
+        clone.querySelector('#content') ||
+        clone.querySelector('.content') ||
+        clone.querySelector('.main-content') ||
+        clone.querySelector('.page-content') ||
+        clone.querySelector('.entry-content') ||
+        clone; // Fallback to cleaned body
+      
+      // STEP 3: Extract structured content with markdown-like formatting
+      const lines = [];
+      const processedTexts = new Set(); // Avoid duplicates
+      
+      function addLine(text, prefix = '') {
+        const cleaned = text.trim().replace(/\s+/g, ' ');
+        if (cleaned && cleaned.length > 2 && !processedTexts.has(cleaned)) {
+          processedTexts.add(cleaned);
+          lines.push(prefix + cleaned);
+        }
+      }
+      
+      // Walk through content elements in order
+      const walker = document.createTreeWalker(
+        contentRoot,
+        NodeFilter.SHOW_ELEMENT,
+        {
+          acceptNode: (node) => {
+            // Skip hidden elements
+            const style = window.getComputedStyle(node);
+            if (style.display === 'none' || style.visibility === 'hidden') {
+              return NodeFilter.FILTER_REJECT;
+            }
+            return NodeFilter.FILTER_ACCEPT;
+          }
+        }
+      );
+      
+      let node;
+      while (node = walker.nextNode()) {
+        const tagName = node.tagName.toLowerCase();
+        
+        // Only process specific content tags
+        if (['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'li', 'blockquote', 'td', 'th'].includes(tagName)) {
+          // Get direct text content (not from children that will be processed separately)
+          const text = node.innerText?.trim();
+          
+          if (text && text.length > 2) {
+            switch (tagName) {
+              case 'h1':
+                addLine(text, '# ');
+                break;
+              case 'h2':
+                addLine(text, '## ');
+                break;
+              case 'h3':
+                addLine(text, '### ');
+                break;
+              case 'h4':
+              case 'h5':
+              case 'h6':
+                addLine(text, '#### ');
+                break;
+              case 'li':
+                addLine(text, '• ');
+                break;
+              case 'blockquote':
+                addLine(text, '> ');
+                break;
+              default:
+                addLine(text);
+            }
+          }
+        }
+      }
+      
+      // If structured extraction yielded little content, fall back to cleaned plaintext
+      if (lines.length < 3) {
+        const plainText = contentRoot.innerText || '';
+        // Clean excessive whitespace but preserve some structure
+        return plainText
+          .split('\n')
+          .map(line => line.trim())
+          .filter(line => line.length > 2)
+          .join('\n')
+          .substring(0, 5000);
+      }
+      
+      return lines.join('\n');
+    }
+
     // Get page title
     const title = (document.title || '').trim();
 
-    // Get all text content
+    // Get all text content (for email/phone extraction)
     const bodyText = document.body?.innerText || '';
 
-    // Extract headings
+    // Extract headings (for separate field)
     const headings = [];
     ['h1', 'h2', 'h3'].forEach(tag => {
       Array.from(document.querySelectorAll(tag)).forEach(el => {
@@ -904,26 +1158,8 @@ async function extractPageContent(page, baseUrl) {
       });
     });
 
-    // Extract main content (try to avoid nav/footer)
-    let content = bodyText;
-    try {
-      const mainContent = 
-        document.querySelector('main') ||
-        document.querySelector('article') ||
-        document.querySelector('[role="main"]') ||
-        document.querySelector('.content') ||
-        document.querySelector('#content') ||
-        document.querySelector('.main-content');
-      
-      if (mainContent) {
-        content = mainContent.innerText || bodyText;
-      }
-    } catch {
-      // Fallback to body text
-    }
-
-    // Clean content: remove excessive whitespace
-    content = content.replace(/\s+/g, ' ').trim();
+    // Extract CLEANED content using our smart function
+    const content = cleanContent();
 
     // ========================================================================
     // ADVANCED IMAGE EXTRACTION (Handles Old Websites)
@@ -1067,7 +1303,7 @@ async function extractPageContent(page, baseUrl) {
       url: currentPageUrl,
       title,
       headings,
-      content: content.substring(0, 3000), // First 3000 chars
+      content: content.substring(0, 5000), // First 5000 chars of cleaned markdown content
       images: sortedImages, // Top 10 largest images with absolute URLs
       emails: [...new Set(emails)],
       phones: [...new Set(phones)],
@@ -1180,7 +1416,7 @@ async function extractSocials(page) {
 async function deepCrawl(inputUrl) {
   let browser;
   const startTime = Date.now();
-  const MAX_PAGES = 10;
+  const MAX_PAGES = 5; // Reduced to prevent Vercel timeouts
   const CONCURRENT_TABS = 3;
 
   try {
@@ -1232,12 +1468,34 @@ async function deepCrawl(inputUrl) {
     // Close homepage
     await homePage.close();
 
-    // Step 2: Filter and limit links
-    const uniqueLinks = [...new Set(discoveredLinks)]
-      .filter(link => link !== baseUrl && link !== baseUrl + '/') // Exclude homepage
-      .slice(0, MAX_PAGES); // Limit to 10 pages
+    // Step 2: Filter and prioritize links
+    const allLinks = [...new Set(discoveredLinks)]
+      .filter(link => link !== baseUrl && link !== baseUrl + '/'); // Exclude homepage
+    
+    // Prioritize links with important slugs
+    const priorityLinks = [];
+    const otherLinks = [];
+    
+    allLinks.forEach(link => {
+      const urlLower = link.toLowerCase();
+      const hasPrioritySlug = PRIORITY_SLUGS.some(slug => 
+        urlLower.includes(`/${slug}`) || urlLower.endsWith(`/${slug}`)
+      );
+      
+      if (hasPrioritySlug) {
+        priorityLinks.push(link);
+      } else {
+        otherLinks.push(link);
+      }
+    });
+    
+    // Take priority links first, then fill with others up to MAX_PAGES
+    const uniqueLinks = [
+      ...priorityLinks.slice(0, MAX_PAGES),
+      ...otherLinks.slice(0, MAX_PAGES - Math.min(priorityLinks.length, MAX_PAGES))
+    ].slice(0, MAX_PAGES);
 
-    console.log(`[DeepCrawler] Will visit ${uniqueLinks.length} subpages`);
+    console.log(`[DeepCrawler] Will visit ${uniqueLinks.length} subpages (${priorityLinks.length} priority pages found)`);
 
     // Step 3: Visit subpages with concurrency control
     const subpageContents = [];
